@@ -2,12 +2,18 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import urllib.parse
 from typing import Dict, Any, Tuple, Optional
+
+# The MCP SDK logs a noisy warning when the server returns 404 on session
+# DELETE (valid per MCP 2025-11-25 §Session Management — 404 means "session
+# already gone").  Suppress it so users don't see spurious errors.
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 # Python 3.10 compatibility: ExceptionGroup was added in 3.11
 try:
