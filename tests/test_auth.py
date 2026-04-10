@@ -507,7 +507,7 @@ class TestAuthorize:
         }
         mock_get.return_value = meta_resp
 
-        with pytest.raises(OAuthError, match="Dynamic Client Registration"):
+        with pytest.raises(OAuthError, match="registration endpoint"):
             authorize("https://example.com/mcp")
 
     @patch("murl.auth._run_callback_server")
@@ -547,64 +547,3 @@ class TestAuthorize:
 
         with pytest.raises(OAuthError, match="does not support S256"):
             authorize("https://example.com/mcp")
-
-    @patch("murl.auth._run_callback_server")
-    @patch("murl.auth.webbrowser.open")
-    @patch("murl.auth.httpx.post")
-    @patch("murl.auth.httpx.get")
-    def test_cimd_used_when_supported(self, mock_get, mock_post, mock_browser, mock_server):
-        """When auth server advertises client_id_metadata_document_supported,
-        CIMD is used instead of dynamic registration."""
-        from murl.auth import CLIENT_ID_METADATA_URL, CIMD_CALLBACK_PORT
-
-        meta_resp = MagicMock()
-        meta_resp.status_code = 200
-        meta_resp.json.return_value = {
-            "authorization_endpoint": "https://auth.example.com/authorize",
-            "token_endpoint": "https://auth.example.com/token",
-            "registration_endpoint": "https://auth.example.com/register",
-            "code_challenge_methods_supported": ["S256"],
-            "client_id_metadata_document_supported": True,
-        }
-        mock_get.return_value = meta_resp
-
-        # Only one POST call needed (token exchange) — no registration POST
-        token_resp = MagicMock()
-        token_resp.status_code = 200
-        token_resp.json.return_value = {
-            "access_token": "at_cimd",
-            "refresh_token": "rt_cimd",
-            "expires_in": 3600,
-        }
-        mock_post.return_value = token_resp
-
-        mock_browser.return_value = True
-        mock_server.return_value = "test_auth_code"
-
-        creds = authorize("https://example.com/mcp")
-
-        assert creds["access_token"] == "at_cimd"
-        assert creds["client_id"] == CLIENT_ID_METADATA_URL
-
-        # Verify no registration POST was made — only token exchange
-        assert mock_post.call_count == 1
-
-        # Verify browser URL uses the CIMD client_id and fixed port
-        auth_url = mock_browser.call_args[0][0]
-        params = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
-        assert params["client_id"] == [CLIENT_ID_METADATA_URL]
-        assert params["redirect_uri"] == [f"http://127.0.0.1:{CIMD_CALLBACK_PORT}/callback"]
-
-    @patch("murl.auth._run_callback_server")
-    @patch("murl.auth.webbrowser.open")
-    @patch("murl.auth.httpx.post")
-    @patch("murl.auth.httpx.get")
-    def test_cimd_fallback_to_dynamic_registration(self, mock_get, mock_post, mock_browser, mock_server):
-        """When auth server does NOT advertise CIMD support, dynamic registration is used."""
-        self._mock_full_flow(mock_get, mock_post, mock_browser, mock_server)
-
-        creds = authorize("https://example.com/mcp")
-
-        # Dynamic registration: first POST is register, second is token exchange
-        assert mock_post.call_count == 2
-        assert creds["client_id"] == "cid_test"  # from register_client mock

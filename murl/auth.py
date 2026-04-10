@@ -3,8 +3,7 @@
 Implements:
 - Protected Resource Metadata discovery (RFC 9728)
 - Authorization Server Metadata with OIDC fallback (RFC 8414)
-- Client ID Metadata Documents (draft-ietf-oauth-client-id-metadata-document-00)
-- Dynamic Client Registration (RFC 7591) as fallback
+- Dynamic Client Registration (RFC 7591)
 - PKCE with S256 (OAuth 2.1)
 - Resource Indicators (RFC 8707)
 """
@@ -26,14 +25,6 @@ import httpx
 
 
 CALLBACK_TIMEOUT = 60  # seconds to wait for browser callback
-
-# Client ID Metadata Document (draft-ietf-oauth-client-id-metadata-document-00)
-# This URL serves as both the client_id and the location of the metadata document.
-# The document must be hosted at this exact URL (e.g., via GitHub Pages).
-CLIENT_ID_METADATA_URL = "https://turlockmike.github.io/murl/oauth/client-metadata.json"
-
-# Fixed callback port for CIMD — the metadata document's redirect_uris must match.
-CIMD_CALLBACK_PORT = 19362
 
 
 class OAuthError(Exception):
@@ -423,6 +414,12 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     token_endpoint = meta["token_endpoint"]
     reg_endpoint = meta.get("registration_endpoint")
 
+    if not reg_endpoint:
+        raise OAuthError(
+            "Server does not advertise a registration endpoint. "
+            "Manual client registration may be required."
+        )
+
     # Verify PKCE support (MCP 2025-11-25 spec requirement)
     challenge_methods = meta.get("code_challenge_methods_supported")
     if challenge_methods is None:
@@ -435,39 +432,19 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
             "Authorization server does not support S256 PKCE code challenge method"
         )
 
-    # --- Step 2: Client registration ---
-    # Priority per MCP spec:
-    #   1. Client ID Metadata Documents (if auth server supports it)
-    #   2. Dynamic Client Registration (fallback)
+    # --- Step 2: Pick a random port for the callback ---
     import socket
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
 
-    use_cimd = meta.get("client_id_metadata_document_supported", False)
+    redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    if use_cimd:
-        # CIMD: use the hosted metadata document URL as client_id with a fixed port
-        click.echo("Using Client ID Metadata Document...", err=True)
-        client_id = CLIENT_ID_METADATA_URL
-        client_secret = None
-        port = CIMD_CALLBACK_PORT
-        redirect_uri = f"http://127.0.0.1:{port}/callback"
-    else:
-        # Dynamic Client Registration (RFC 7591)
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-
-        redirect_uri = f"http://127.0.0.1:{port}/callback"
-
-        if not reg_endpoint:
-            raise OAuthError(
-                "Server does not support Client ID Metadata Documents or "
-                "Dynamic Client Registration. Manual client registration may be required."
-            )
-
-        click.echo("Registering client...", err=True)
-        reg = register_client(reg_endpoint, redirect_uri)
-        client_id = reg["client_id"]
-        client_secret = reg.get("client_secret")
+    # --- Step 3: Dynamic client registration ---
+    click.echo("Registering client...", err=True)
+    reg = register_client(reg_endpoint, redirect_uri)
+    client_id = reg["client_id"]
+    client_secret = reg.get("client_secret")
 
     # --- Step 4: PKCE + authorization URL with resource parameter (RFC 8707) ---
     code_verifier, code_challenge = _generate_pkce()
