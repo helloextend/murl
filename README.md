@@ -98,10 +98,24 @@ murl http://localhost:3000/tools | jq -r '.name'
 | `-d, --data` | Add key=value or JSON data (repeatable) |
 | `-H, --header` | Add HTTP header (repeatable) |
 | `-v, --verbose` | Pretty-print output, show request debug info |
+| `--format toon` | Output in [TOON](https://github.com/toon-format/spec) format (token-efficient for LLMs) |
 | `--login` | Force OAuth re-authentication |
 | `--no-auth` | Skip all authentication |
 | `--version` | Show version info |
 | `--upgrade` | Upgrade to latest version |
+
+### TOON Output
+
+Use `--format toon` for [TOON](https://github.com/toon-format/spec) output, which uses fewer tokens than JSON when feeding results into LLM contexts. Requires the optional `python-toon` package:
+
+```bash
+pip install mcp-curl[toon]
+
+# List tools in TOON format
+murl https://mcp.deepwiki.com/mcp/tools --format toon
+
+# TOON uses tabular encoding for lists — field names declared once, then rows of values
+```
 
 ### OAuth
 

@@ -350,6 +350,7 @@ OPTIONS:
   -d, --data <key=value|JSON>  Request data (repeatable)
   -H, --header <Key: Value>    HTTP header (repeatable)
   -v, --verbose                Pretty-print output, show request debug info
+  --format <toon>              Output format (toon = token-efficient for LLMs)
   --login                      Force OAuth re-authentication
   --no-auth                    Skip all authentication
   --version                    Version info
@@ -362,7 +363,7 @@ URL PATHS:
   /prompts          List prompts       /prompts/<name>     Get prompt
 
 OUTPUT:
-  stdout  Compact JSON (NDJSON for lists). Pretty-printed with -v.
+  stdout  Compact JSON (NDJSON for lists). Pretty-printed with -v. TOON with --format toon.
   stderr  Errors as {"error":"CODE","message":"...","code":N}
   exit    0=success  1=error  2=invalid args"""
     click.echo(help_text)
@@ -383,10 +384,12 @@ OUTPUT:
               help='Show version')
 @click.option('--upgrade', is_flag=True, callback=run_upgrade, expose_value=False, is_eager=True,
               help='Upgrade murl')
+@click.option('--format', 'output_format', type=click.Choice(['toon']), default=None,
+              help='Output format: toon (token-efficient for LLMs)')
 @click.option('--login', is_flag=True, help='Force OAuth re-authentication')
 @click.option('--no-auth', is_flag=True, help='Skip all authentication')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
-         verbose: bool, login: bool, no_auth: bool):
+         verbose: bool, output_format: Optional[str], login: bool, no_auth: bool):
     """murl - MCP Curl"""
     if url is None:
         output_error(
@@ -394,6 +397,14 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
             message="URL argument is required",
             exit_code=ErrorCode.INVALID_ARGUMENT,
             suggestion="Run: murl --help"
+        )
+
+    if output_format and verbose:
+        output_error(
+            error_type="INVALID_ARGUMENT",
+            message="--format and --verbose are mutually exclusive",
+            exit_code=ErrorCode.INVALID_ARGUMENT,
+            suggestion="Use --format for alternative output or -v for verbose JSON, not both"
         )
 
     try:
@@ -449,6 +460,17 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         # --- Output ---
         if verbose:
             click.echo(json.dumps(result, indent=2))
+        elif output_format == 'toon':
+            try:
+                from toon import encode as toon_encode
+            except ImportError:
+                output_error(
+                    error_type="MISSING_DEPENDENCY",
+                    message="python-toon package is required for --format toon",
+                    exit_code=ErrorCode.GENERAL_ERROR,
+                    suggestion="Install it with: pip install mcp-curl[toon]"
+                )
+            click.echo(toon_encode(result))
         elif isinstance(result, list):
             for item in result:
                 click.echo(json.dumps(item, separators=(',', ':')))
