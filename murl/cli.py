@@ -22,6 +22,12 @@ from murl import __version__
 from murl.token_store import get_credentials, save_credentials, clear_credentials, is_expired
 from murl.auth import authorize, refresh_token, OAuthError
 
+# Optional TOON format support (pip install mcp-curl[toon])
+try:
+    from toon import encode as toon_encode
+except ImportError:
+    toon_encode = None
+
 
 # Error patterns for connection failures
 # Note: These patterns are based on httpx/httpcore error messages and may need
@@ -461,9 +467,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         if verbose:
             click.echo(json.dumps(result, indent=2))
         elif output_format == 'toon':
-            try:
-                from toon import encode as toon_encode
-            except ImportError:
+            if toon_encode is None:
                 output_error(
                     error_type="MISSING_DEPENDENCY",
                     message="python-toon package is required for --format toon",

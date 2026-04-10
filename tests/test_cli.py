@@ -701,13 +701,16 @@ def test_toon_output_tool_call(mcp_server):
     assert result.exit_code == 0
     output = result.output.strip()
     assert 'hello' in output
+    # Verify output is TOON, not passthrough JSON
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)
 
 
-def test_toon_format_verbose_mutually_exclusive():
+def test_toon_format_verbose_mutually_exclusive(mcp_server):
     """--format and --verbose together should error."""
     runner = CliRunner()
     result = runner.invoke(main, [
-        "http://localhost:8765/tools", "--format", "toon", "-v", "--no-auth"
+        f"{mcp_server}/tools", "--format", "toon", "-v", "--no-auth"
     ])
 
     assert result.exit_code == 2
@@ -736,17 +739,9 @@ def test_toon_roundtrip_tools_list(mcp_server):
 def test_toon_missing_dependency(mcp_server):
     """--format toon with missing python-toon shows helpful error."""
     from unittest.mock import patch
-    import builtins
-
-    original_import = builtins.__import__
-
-    def mock_import(name, *args, **kwargs):
-        if name == 'toon':
-            raise ImportError("No module named 'toon'")
-        return original_import(name, *args, **kwargs)
 
     runner = CliRunner()
-    with patch.object(builtins, '__import__', side_effect=mock_import):
+    with patch("murl.cli.toon_encode", None):
         result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
 
     assert result.exit_code == 1
@@ -772,8 +767,13 @@ def test_toon_nested_objects(mcp_server):
         assert isinstance(tool['inputSchema'], dict)
 
 
-def test_toon_empty_result():
+def test_toon_empty_result(mcp_server):
     """TOON handles empty list results without error."""
-    from toon import encode as toon_encode
-    result = toon_encode([])
-    assert result == '[0]:'
+    from unittest.mock import patch, AsyncMock
+
+    runner = CliRunner()
+    with patch("murl.cli.make_mcp_request", new_callable=AsyncMock, return_value=[]):
+        result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+
+    assert result.exit_code == 0
+    assert '[0]:' in result.output

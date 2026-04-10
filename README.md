@@ -111,10 +111,8 @@ Use `--format toon` for [TOON](https://github.com/toon-format/spec) output, whic
 ```bash
 pip install mcp-curl[toon]
 
-# List tools in TOON format
+# List tools in TOON format — produces fewer tokens than JSON for structured data
 murl https://mcp.deepwiki.com/mcp/tools --format toon
-
-# TOON uses tabular encoding for lists — field names declared once, then rows of values
 ```
 
 ### OAuth
