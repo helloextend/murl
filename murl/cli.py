@@ -19,6 +19,7 @@ import click
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from murl import __version__
+import httpx as _httpx
 from murl.token_store import get_credentials, save_credentials, clear_credentials, is_expired
 from murl.auth import authorize, refresh_token, OAuthError, parse_www_authenticate
 
@@ -395,7 +396,7 @@ AUTHENTICATION:
   murl -H "Authorization: Bearer <tok>" <url>  # Manual token
 
   Pre-configured OAuth:
-  murl --client-id ID --client-secret SECRET --callback-port 8080 <url>
+  murl --client-id ID --client-secret SECRET --callback-port 8080 --scope openid <url>
 
   Credentials: ~/.murl/credentials/<hash>.json
 
@@ -409,6 +410,7 @@ OPTIONS:
   --client-id <id>             Pre-registered OAuth client ID (skip DCR)
   --client-secret <secret>     Pre-registered OAuth client secret
   --callback-port <port>       Fixed port for OAuth callback redirect URI
+  --scope <scopes>             OAuth scope to request (e.g. "openid profile")
   --version                    Version info
   --upgrade                    Self-upgrade via pip
   -h, --help                   This help
@@ -424,6 +426,30 @@ OUTPUT:
   exit    0=success  1=error  2=invalid args"""
     click.echo(help_text)
     ctx.exit()
+
+
+def _probe_www_authenticate(base_url: str) -> Optional[str]:
+    """Send an unauthenticated POST to the MCP endpoint to elicit a 401.
+
+    Per MCP 2025-11-25 §Protected Resource Metadata Discovery Requirements,
+    the server MUST include the resource_metadata URL in the WWW-Authenticate
+    header on 401 responses.  For servers with complex URLs (encoded ARNs,
+    query parameters), well-known URI construction from the URL alone may fail,
+    so this probe ensures we get the server-provided discovery URL.
+
+    Returns the WWW-Authenticate header value, or None if the probe fails.
+    """
+    try:
+        resp = _httpx.post(
+            base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            return resp.headers.get("www-authenticate")
+    except _httpx.HTTPError:
+        pass
+    return None
 
 
 @click.command()
@@ -448,10 +474,12 @@ OUTPUT:
 @click.option('--client-secret', default=None, help='Pre-registered OAuth client secret')
 @click.option('--callback-port', default=None, type=int,
               help='Fixed port for OAuth callback (must match registered redirect URI)')
+@click.option('--scope', default=None,
+              help='OAuth scope to request (e.g. "openid profile")')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
          verbose: bool, output_format: Optional[str], login: bool, no_auth: bool,
          client_id: Optional[str], client_secret: Optional[str],
-         callback_port: Optional[int]):
+         callback_port: Optional[int], scope: Optional[str]):
     """murl - MCP Curl"""
     if url is None:
         output_error(
@@ -484,6 +512,8 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
             auth_kwargs["client_secret"] = client_secret
         if callback_port:
             auth_kwargs["callback_port"] = callback_port
+        if scope:
+            auth_kwargs["scope"] = scope
 
         has_auth_header = any(k.lower() == 'authorization' for k in headers)
         if not no_auth and not has_auth_header:
@@ -498,11 +528,17 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                         creds = refresh_token(creds)
                         save_credentials(base_url, creds)
                     except OAuthError:
-                        creds = authorize(base_url, **auth_kwargs)
+                        # Probe for WWW-Authenticate so discovery has the
+                        # resource_metadata URL (needed for complex server URLs).
+                        www_auth = _probe_www_authenticate(base_url)
+                        creds = authorize(base_url, www_authenticate=www_auth, **auth_kwargs)
                         save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
             elif login:
-                creds = authorize(base_url, **auth_kwargs)
+                # Probe for WWW-Authenticate so discovery has the
+                # resource_metadata URL (needed for complex server URLs).
+                www_auth = _probe_www_authenticate(base_url)
+                creds = authorize(base_url, www_authenticate=www_auth, **auth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
 

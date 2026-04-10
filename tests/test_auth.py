@@ -432,6 +432,7 @@ class TestDiscoverAuthServerMetadata:
 
             result = discover_auth_server_metadata("https://auth.example.com")
             assert result["token_endpoint"] == "https://auth.example.com/token"
+            assert result["_discovery_source"] == "rfc8414"
 
     def test_oidc_fallback(self):
         """RFC 8414 fails, OIDC discovery succeeds."""
@@ -450,6 +451,7 @@ class TestDiscoverAuthServerMetadata:
 
             result = discover_auth_server_metadata("https://auth.example.com")
             assert result["token_endpoint"] == "https://auth.example.com/token"
+            assert result["_discovery_source"] == "oidc"
             assert mock_get.call_count == 2
 
     def test_with_path_component(self):
@@ -631,6 +633,62 @@ class TestAuthorize:
     @patch("murl.auth.webbrowser.open")
     @patch("murl.auth.httpx.post")
     @patch("murl.auth.httpx.get")
+    def test_pkce_oidc_missing_proceeds_with_warning(self, mock_get, mock_post, mock_browser, mock_server):
+        """OIDC metadata without code_challenge_methods_supported should warn but proceed.
+
+        OIDC Provider Metadata does not define this field (it's an OAuth 2.0 AS
+        Metadata field).  Major IDPs like Okta fully support S256 PKCE but don't
+        include the field in their OIDC discovery document.
+        """
+        # Resource metadata -> points to auth server
+        resource_meta_resp = MagicMock()
+        resource_meta_resp.status_code = 200
+        resource_meta_resp.json.return_value = {
+            "authorization_servers": ["https://auth.example.com/oauth2/default"],
+        }
+
+        # Auth server metadata via OIDC (no code_challenge_methods_supported)
+        oidc_resp = MagicMock()
+        oidc_resp.status_code = 200
+        oidc_resp.json.return_value = {
+            "issuer": "https://auth.example.com/oauth2/default",
+            "authorization_endpoint": "https://auth.example.com/oauth2/default/v1/authorize",
+            "token_endpoint": "https://auth.example.com/oauth2/default/v1/token",
+            "registration_endpoint": "https://auth.example.com/oauth2/v1/clients",
+            # No code_challenge_methods_supported — typical for Okta OIDC
+        }
+
+        # RFC 8414 fails (404/405), OIDC path-insert fails, OIDC path-append succeeds
+        not_found = MagicMock()
+        not_found.status_code = 405
+
+        # Order: resource_meta path-aware, resource_meta root, AS rfc8414, OIDC insert, OIDC append
+        mock_get.side_effect = [resource_meta_resp, not_found, not_found, oidc_resp]
+
+        # Registration + token exchange
+        reg_resp = MagicMock()
+        reg_resp.status_code = 201
+        reg_resp.json.return_value = {"client_id": "cid_oidc"}
+
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.json.return_value = {
+            "access_token": "at_oidc",
+            "refresh_token": "rt_oidc",
+            "expires_in": 3600,
+        }
+        mock_post.side_effect = [reg_resp, token_resp]
+        mock_browser.return_value = True
+        mock_server.return_value = "test_auth_code"
+
+        # Should succeed despite missing code_challenge_methods_supported
+        creds = authorize("https://example.com/mcp")
+        assert creds["access_token"] == "at_oidc"
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
     def test_pkce_s256_not_supported(self, mock_get, mock_post, mock_browser, mock_server):
         """authorize() must refuse if S256 is not in code_challenge_methods_supported."""
         meta_resp = MagicMock()
@@ -690,7 +748,7 @@ class TestAuthorize:
         auth_url = mock_browser.call_args[0][0]
         params = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
         assert params["client_id"] == ["my-app-id"]
-        assert params["redirect_uri"] == ["http://127.0.0.1:8080/callback"]
+        assert params["redirect_uri"] == ["http://localhost:8080/callback"]
 
         # Verify token exchange includes client_secret
         token_data = mock_post.call_args[1].get("data", {})

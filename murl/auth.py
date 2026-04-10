@@ -165,6 +165,12 @@ def discover_auth_server_metadata(issuer_url: str) -> dict:
             except json.JSONDecodeError:
                 continue
             if isinstance(meta, dict) and "token_endpoint" in meta:
+                # Tag the source so callers can distinguish RFC 8414 from OIDC.
+                # OIDC Provider Metadata does not define code_challenge_methods_supported,
+                # so its absence from an OIDC endpoint is expected (see PKCE check).
+                meta["_discovery_source"] = (
+                    "oidc" if "openid-configuration" in url else "rfc8414"
+                )
                 return meta
 
     raise OAuthError(
@@ -448,13 +454,29 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     # MCP 2025-11-25 §Authorization Code Protection: clients MUST verify PKCE
     # support via code_challenge_methods_supported before proceeding, and MUST
     # use S256 when technically capable (OAuth 2.1 §4.1.1).
+    #
+    # However, OIDC Provider Metadata (OpenID Connect Discovery 1.0) does NOT
+    # define code_challenge_methods_supported — it's an OAuth 2.0 AS Metadata
+    # field.  Major IDPs like Okta serve OIDC metadata without this field yet
+    # fully support S256 PKCE.  The MCP spec acknowledges this:
+    #   "this field is commonly included by OpenID providers"
+    # When metadata comes from an OIDC endpoint, we warn but proceed with S256
+    # rather than blocking all Okta/OIDC-based servers.
     challenge_methods = meta.get("code_challenge_methods_supported")
+    discovery_source = meta.get("_discovery_source", "unknown")
     if challenge_methods is None:
-        raise OAuthError(
-            "Authorization server does not advertise PKCE support "
-            "(code_challenge_methods_supported). Cannot proceed securely."
-        )
-    if "S256" not in challenge_methods:
+        if discovery_source == "oidc":
+            click.echo(
+                "Warning: OIDC metadata does not include "
+                "code_challenge_methods_supported; assuming S256 is supported.",
+                err=True,
+            )
+        else:
+            raise OAuthError(
+                "Authorization server does not advertise PKCE support "
+                "(code_challenge_methods_supported). Cannot proceed securely."
+            )
+    elif "S256" not in challenge_methods:
         raise OAuthError(
             "Authorization server does not support S256 PKCE code challenge method"
         )
@@ -468,7 +490,10 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
             s.bind(("127.0.0.1", 0))
             port = s.getsockname()[1]
 
-    redirect_uri = f"http://127.0.0.1:{port}/callback"
+    # Use "localhost" rather than "127.0.0.1" — most IDPs (Okta, Cognito, etc.)
+    # register redirect URIs with "localhost".  Both resolve to loopback, but
+    # IDPs do exact string matching on the redirect_uri parameter.
+    redirect_uri = f"http://localhost:{port}/callback"
 
     # --- Step 3: Client registration ---
     # MCP 2025-11-25 §Client Registration Approaches priority:
