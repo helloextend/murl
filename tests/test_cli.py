@@ -862,3 +862,223 @@ def test_cli_unsupported_capability_error():
     assert error_obj["error"] == "INVALID_ARGUMENT"
     assert "Server does not support 'resources'" in error_obj["message"]
     assert "tools, logging" in error_obj["message"]
+
+
+# ---------------------------------------------------------------------------
+# Pagination tests — MCP 2025-11-25 cursor-based pagination
+# ---------------------------------------------------------------------------
+
+def test_pagination_tools_list():
+    """tools/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    # Build two pages of tools
+    tool_a = MagicMock()
+    tool_a.model_dump.return_value = {"name": "tool_a"}
+    tool_b = MagicMock()
+    tool_b.model_dump.return_value = {"name": "tool_b"}
+    tool_c = MagicMock()
+    tool_c.model_dump.return_value = {"name": "tool_c"}
+
+    page1 = MagicMock()
+    page1.tools = [tool_a, tool_b]
+    page1.nextCursor = "cursor_page2"
+
+    page2 = MagicMock()
+    page2.tools = [tool_c]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_tools = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = MagicMock()
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "tools/list", {}, {}, False
+        ))
+
+    assert len(result) == 3
+    assert result[0]["name"] == "tool_a"
+    assert result[2]["name"] == "tool_c"
+    # Verify cursor was passed on second call
+    assert mock_session.list_tools.call_count == 2
+    second_call_kwargs = mock_session.list_tools.call_args_list[1]
+    assert second_call_kwargs[1]["cursor"] == "cursor_page2"
+
+
+def test_pagination_resources_list():
+    """resources/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    res_a = MagicMock()
+    res_a.model_dump.return_value = {"uri": "file:///a.txt", "name": "a"}
+    res_b = MagicMock()
+    res_b.model_dump.return_value = {"uri": "file:///b.txt", "name": "b"}
+
+    page1 = MagicMock()
+    page1.resources = [res_a]
+    page1.nextCursor = "page2"
+
+    page2 = MagicMock()
+    page2.resources = [res_b]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_resources = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = None
+    init_result.capabilities.resources = MagicMock()
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "resources/list", {}, {}, False
+        ))
+
+    assert len(result) == 2
+    assert result[0]["name"] == "a"
+    assert result[1]["name"] == "b"
+    assert mock_session.list_resources.call_count == 2
+
+
+def test_pagination_prompts_list():
+    """prompts/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    prompt_a = MagicMock()
+    prompt_a.model_dump.return_value = {"name": "greeting"}
+    prompt_b = MagicMock()
+    prompt_b.model_dump.return_value = {"name": "farewell"}
+
+    page1 = MagicMock()
+    page1.prompts = [prompt_a]
+    page1.nextCursor = "next"
+
+    page2 = MagicMock()
+    page2.prompts = [prompt_b]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_prompts = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = None
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = MagicMock()
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "prompts/list", {}, {}, False
+        ))
+
+    assert len(result) == 2
+    assert result[0]["name"] == "greeting"
+    assert result[1]["name"] == "farewell"
+    assert mock_session.list_prompts.call_count == 2
+
+
+def test_pagination_single_page_no_extra_calls():
+    """When nextCursor is None on first page, no additional requests are made."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    tool = MagicMock()
+    tool.model_dump.return_value = {"name": "only_tool"}
+
+    page = MagicMock()
+    page.tools = [tool]
+    page.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=page)
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = MagicMock()
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "tools/list", {}, {}, False
+        ))
+
+    assert len(result) == 1
+    assert result[0]["name"] == "only_tool"
+    # Only one call — no extra pagination requests
+    assert mock_session.list_tools.call_count == 1

@@ -264,24 +264,47 @@ async def make_mcp_request(
                             f"Server does not support '{category}'. Supported: {', '.join(available)}"
                         )
 
+                # List operations use cursor-based pagination (MCP 2025-11-25).
+                # We collect all pages so the caller gets the complete result set.
                 if method == 'tools/list':
-                    result = await session.list_tools()
-                    return [tool.model_dump(mode='json', exclude_none=True) for tool in result.tools]
+                    all_items = []
+                    cursor = None
+                    while True:
+                        result = await session.list_tools(cursor=cursor)
+                        all_items.extend(result.tools)
+                        if not result.nextCursor:
+                            break
+                        cursor = result.nextCursor
+                    return [t.model_dump(mode='json', exclude_none=True) for t in all_items]
                 elif method == 'tools/call':
                     tool_name = params.get('name')
                     arguments = params.get('arguments', {})
                     result = await session.call_tool(tool_name, arguments)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.content]
                 elif method == 'resources/list':
-                    result = await session.list_resources()
-                    return [resource.model_dump(mode='json', exclude_none=True) for resource in result.resources]
+                    all_items = []
+                    cursor = None
+                    while True:
+                        result = await session.list_resources(cursor=cursor)
+                        all_items.extend(result.resources)
+                        if not result.nextCursor:
+                            break
+                        cursor = result.nextCursor
+                    return [r.model_dump(mode='json', exclude_none=True) for r in all_items]
                 elif method == 'resources/read':
                     uri = params.get('uri')
                     result = await session.read_resource(uri)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.contents]
                 elif method == 'prompts/list':
-                    result = await session.list_prompts()
-                    return [prompt.model_dump(mode='json', exclude_none=True) for prompt in result.prompts]
+                    all_items = []
+                    cursor = None
+                    while True:
+                        result = await session.list_prompts(cursor=cursor)
+                        all_items.extend(result.prompts)
+                        if not result.nextCursor:
+                            break
+                        cursor = result.nextCursor
+                    return [p.model_dump(mode='json', exclude_none=True) for p in all_items]
                 elif method == 'prompts/get':
                     prompt_name = params.get('name')
                     arguments = params.get('arguments', {})
