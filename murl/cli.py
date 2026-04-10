@@ -350,7 +350,7 @@ OPTIONS:
   -d, --data <key=value|JSON>  Request data (repeatable)
   -H, --header <Key: Value>    HTTP header (repeatable)
   -v, --verbose                Pretty-print output, show request debug info
-  --format <toon>              Output format (toon = token-efficient for LLMs)
+  --format <json|toon>          Output format (default: json, toon for LLMs)
   --login                      Force OAuth re-authentication
   --no-auth                    Skip all authentication
   --version                    Version info
@@ -384,8 +384,8 @@ OUTPUT:
               help='Show version')
 @click.option('--upgrade', is_flag=True, callback=run_upgrade, expose_value=False, is_eager=True,
               help='Upgrade murl')
-@click.option('--format', 'output_format', type=click.Choice(['toon']), default=None,
-              help='Output format: toon (token-efficient for LLMs)')
+@click.option('--format', 'output_format', type=click.Choice(['json', 'toon']), default='json',
+              help='Output format (default: json, toon = token-efficient for LLMs)')
 @click.option('--login', is_flag=True, help='Force OAuth re-authentication')
 @click.option('--no-auth', is_flag=True, help='Skip all authentication')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
@@ -399,7 +399,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
             suggestion="Run: murl --help"
         )
 
-    if output_format and verbose:
+    if output_format != 'json' and verbose:
         output_error(
             error_type="INVALID_ARGUMENT",
             message="--format and --verbose are mutually exclusive",
