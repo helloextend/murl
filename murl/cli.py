@@ -470,6 +470,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                     exit_code=ErrorCode.GENERAL_ERROR,
                     suggestion="Install it with: pip install mcp-curl[toon]"
                 )
+                return
             click.echo(toon_encode(result))
         elif isinstance(result, list):
             for item in result:
