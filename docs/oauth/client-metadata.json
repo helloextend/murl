@@ -1,0 +1,14 @@
+{
+  "client_id": "https://turlockmike.github.io/murl/oauth/client-metadata.json",
+  "client_name": "murl - MCP Curl",
+  "client_uri": "https://github.com/turlockmike/murl",
+  "logo_uri": "https://raw.githubusercontent.com/turlockmike/murl/master/images/logo.png",
+  "redirect_uris": [
+    "http://127.0.0.1:19362/callback",
+    "http://localhost:19362/callback"
+  ],
+  "grant_types": ["authorization_code"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "none",
+  "scope": ""
+}
