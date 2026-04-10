@@ -38,6 +38,10 @@ class OAuthError(Exception):
 def parse_www_authenticate(header_value: str) -> dict:
     """Parse a WWW-Authenticate Bearer header into a dict of parameters.
 
+    Per MCP 2025-11-25 §Protected Resource Metadata Discovery Requirements,
+    clients MUST be able to parse WWW-Authenticate headers and respond
+    appropriately to HTTP 401/403 responses.
+
     Handles: Bearer resource_metadata="...", scope="...", error="..."
     Returns dict with keys like resource_metadata, scope, error, error_description.
     """
@@ -69,12 +73,16 @@ def parse_www_authenticate(header_value: str) -> dict:
 def discover_resource_metadata(server_url: str, resource_metadata_url: Optional[str] = None) -> dict:
     """Fetch Protected Resource Metadata per RFC 9728.
 
-    If resource_metadata_url is provided (from WWW-Authenticate header), use it directly.
-    Otherwise, try well-known URIs:
-      1. /.well-known/oauth-protected-resource/<path> (path-aware)
-      2. /.well-known/oauth-protected-resource (root)
+    Per MCP 2025-11-25 §Authorization Server Location, clients MUST use
+    Protected Resource Metadata for authorization server discovery.
 
-    Returns the metadata dict, which must contain 'authorization_servers'.
+    Per §Protected Resource Metadata Discovery Requirements, clients MUST:
+      - Use the resource_metadata URL from WWW-Authenticate when present.
+      - Otherwise fall back to well-known URIs in this order:
+        1. /.well-known/oauth-protected-resource/<path>  (path-aware)
+        2. /.well-known/oauth-protected-resource          (root)
+
+    Returns the metadata dict, which MUST contain 'authorization_servers'.
     Raises OAuthError if discovery fails.
     """
     urls_to_try = []
@@ -119,15 +127,18 @@ def discover_resource_metadata(server_url: str, resource_metadata_url: Optional[
 def discover_auth_server_metadata(issuer_url: str) -> dict:
     """Fetch Authorization Server Metadata with OIDC Discovery fallback.
 
-    Per MCP 2025-11-25 spec, clients MUST try:
-      For issuer with path (e.g. https://auth.example.com/tenant1):
-        1. /.well-known/oauth-authorization-server/tenant1  (RFC 8414)
-        2. /.well-known/openid-configuration/tenant1        (OIDC path insertion)
-        3. /tenant1/.well-known/openid-configuration        (OIDC path append)
+    Per MCP 2025-11-25 §Authorization Server Metadata Discovery, clients
+    MUST attempt multiple well-known endpoints.  Priority order follows
+    RFC 8414 §3.1 and §5 (OIDC interop).
 
-      For issuer without path (e.g. https://auth.example.com):
-        1. /.well-known/oauth-authorization-server           (RFC 8414)
-        2. /.well-known/openid-configuration                 (OIDC)
+    For issuer with path (e.g. https://auth.example.com/tenant1), MUST try:
+      1. /.well-known/oauth-authorization-server/tenant1  (RFC 8414)
+      2. /.well-known/openid-configuration/tenant1        (OIDC path insertion)
+      3. /tenant1/.well-known/openid-configuration        (OIDC path append)
+
+    For issuer without path (e.g. https://auth.example.com), MUST try:
+      1. /.well-known/oauth-authorization-server           (RFC 8414)
+      2. /.well-known/openid-configuration                 (OIDC)
     """
     parsed = urllib.parse.urlparse(issuer_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -216,6 +227,11 @@ def discover_metadata(server_url: str) -> dict:
 def register_client(registration_endpoint: str, redirect_uri: str) -> dict:
     """Dynamic Client Registration (RFC 7591).
 
+    Per MCP 2025-11-25 §Client Registration Approaches, DCR is a MAY-level
+    fallback used when the client has no pre-registered credentials and the
+    auth server does not support Client ID Metadata Documents.
+
+    Registers as a public client (token_endpoint_auth_method=none).
     Returns dict with at least ``client_id`` and optionally ``client_secret``.
     """
     payload = {
@@ -343,12 +359,17 @@ def _generate_pkce() -> tuple:
 def _canonical_resource_uri(server_url: str) -> str:
     """Build the canonical resource URI for RFC 8707 resource parameter.
 
-    Per the spec: scheme + authority + path, no fragment, no trailing slash ambiguity.
+    Per MCP 2025-11-25 §Resource Parameter Implementation:
+      - MUST use the canonical URI of the MCP server (RFC 8707 §2).
+      - MUST NOT include fragments.
+      - SHOULD use the form without trailing slash unless semantically significant.
+      - SHOULD provide the most specific URI possible.
     """
     parsed = urllib.parse.urlparse(server_url)
-    # Reconstruct without fragment or query
+    # Reconstruct without fragment or query; keep path as-is (no synthetic "/")
+    # so that "https://example.com" stays "https://example.com" per spec SHOULD.
     return urllib.parse.urlunparse((
-        parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""
+        parsed.scheme, parsed.netloc, parsed.path, "", "", ""
     ))
 
 
@@ -389,7 +410,11 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     www_auth_params = parse_www_authenticate(www_authenticate) if www_authenticate else {}
     resource_metadata_url = www_auth_params.get("resource_metadata")
 
-    # Scope priority: explicit param > WWW-Authenticate > resource metadata
+    # MCP 2025-11-25 §Scope Selection Strategy — priority order:
+    #   1. Explicit scope param (from caller, e.g. 403 step-up)
+    #   2. scope from WWW-Authenticate header
+    #   3. scopes_supported from Protected Resource Metadata
+    #   4. Omit scope entirely if none available
     if not scope and www_auth_params.get("scope"):
         scope = www_auth_params["scope"]
 
@@ -420,7 +445,9 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     token_endpoint = meta["token_endpoint"]
     reg_endpoint = meta.get("registration_endpoint")
 
-    # Verify PKCE support (MCP 2025-11-25 spec requirement)
+    # MCP 2025-11-25 §Authorization Code Protection: clients MUST verify PKCE
+    # support via code_challenge_methods_supported before proceeding, and MUST
+    # use S256 when technically capable (OAuth 2.1 §4.1.1).
     challenge_methods = meta.get("code_challenge_methods_supported")
     if challenge_methods is None:
         raise OAuthError(
@@ -444,7 +471,11 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
     # --- Step 3: Client registration ---
-    # Priority per MCP spec: pre-configured > Dynamic Client Registration
+    # MCP 2025-11-25 §Client Registration Approaches priority:
+    #   1. Pre-registered credentials (--client-id)
+    #   2. Client ID Metadata Documents (not implemented — SHOULD level)
+    #   3. Dynamic Client Registration (fallback)
+    #   4. Prompt user (we raise with guidance to use --client-id)
     if client_id:
         click.echo("Using pre-configured client credentials...", err=True)
     else:
@@ -458,7 +489,9 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
         client_id = reg["client_id"]
         client_secret = reg.get("client_secret")
 
-    # --- Step 4: PKCE + authorization URL with resource parameter (RFC 8707) ---
+    # --- Step 4: PKCE + authorization URL ---
+    # MCP 2025-11-25 §Resource Parameter Implementation: resource MUST be
+    # included in both authorization requests and token requests (RFC 8707).
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(32)
 
@@ -500,7 +533,8 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
     auth_code = code_result[0]
 
-    # --- Step 6: Token exchange with resource parameter (RFC 8707) ---
+    # --- Step 6: Token exchange ---
+    # RFC 8707: resource MUST be included in token requests (MCP 2025-11-25).
     click.echo("Exchanging authorization code for token...", err=True)
     token_data = {
         "grant_type": "authorization_code",
@@ -543,6 +577,11 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 def refresh_token(creds: dict) -> dict:
     """Use a refresh token to get a new access token.
 
+    Per MCP 2025-11-25 §Resource Parameter Implementation, the ``resource``
+    parameter MUST be included in token requests — including refresh requests
+    (RFC 8707 §2).  This ensures the refreshed token is audience-bound to the
+    same MCP server.
+
     Returns updated credential dict.
     Raises OAuthError if refresh fails.
     """
@@ -557,6 +596,9 @@ def refresh_token(creds: dict) -> dict:
     }
     if creds.get("client_secret"):
         data["client_secret"] = creds["client_secret"]
+    # RFC 8707: resource MUST be included in token requests (MCP 2025-11-25).
+    if creds.get("resource_uri"):
+        data["resource"] = creds["resource_uri"]
 
     resp = httpx.post(creds["token_endpoint"], data=data, timeout=10)
     if resp.status_code != 200:

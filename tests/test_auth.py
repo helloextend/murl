@@ -189,6 +189,11 @@ class TestRegisterClient:
 # ---------------------------------------------------------------------------
 
 class TestRefreshToken:
+    """MCP 2025-11-25 §Resource Parameter Implementation / RFC 8707.
+
+    refresh_token() MUST include the ``resource`` parameter in the token
+    request so that the refreshed access token is audience-bound.
+    """
 
     def test_success(self):
         creds = {
@@ -196,6 +201,7 @@ class TestRefreshToken:
             "client_secret": None,
             "refresh_token": "rt_old",
             "token_endpoint": "https://auth.example.com/token",
+            "resource_uri": "https://mcp.example.com/mcp",
         }
 
         with patch("murl.auth.httpx.post") as mock_post:
@@ -212,6 +218,79 @@ class TestRefreshToken:
             assert updated["access_token"] == "new_at"
             assert updated["refresh_token"] == "new_rt"
             assert updated["expires_at"] > time.time()
+
+    def test_resource_included_in_refresh_request(self):
+        """RFC 8707: resource MUST be sent in token requests including refresh."""
+        creds = {
+            "client_id": "cid",
+            "client_secret": None,
+            "refresh_token": "rt_old",
+            "token_endpoint": "https://auth.example.com/token",
+            "resource_uri": "https://mcp.example.com/mcp",
+        }
+
+        with patch("murl.auth.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "access_token": "new_at",
+                "expires_in": 3600,
+            }
+            mock_post.return_value = mock_resp
+
+            refresh_token(creds)
+
+            post_data = mock_post.call_args[1].get("data", {})
+            assert post_data["resource"] == "https://mcp.example.com/mcp"
+
+    def test_resource_omitted_when_missing_from_creds(self):
+        """Legacy creds without resource_uri should not break refresh."""
+        creds = {
+            "client_id": "cid",
+            "client_secret": None,
+            "refresh_token": "rt_old",
+            "token_endpoint": "https://auth.example.com/token",
+            # No resource_uri — pre-existing creds from before spec update
+        }
+
+        with patch("murl.auth.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "access_token": "new_at",
+                "expires_in": 3600,
+            }
+            mock_post.return_value = mock_resp
+
+            refresh_token(creds)
+
+            post_data = mock_post.call_args[1].get("data", {})
+            assert "resource" not in post_data
+
+    def test_client_secret_included_in_refresh(self):
+        """Confidential clients (pre-configured) MUST send client_secret on refresh."""
+        creds = {
+            "client_id": "cid",
+            "client_secret": "sec123",
+            "refresh_token": "rt_old",
+            "token_endpoint": "https://auth.example.com/token",
+            "resource_uri": "https://mcp.example.com/mcp",
+        }
+
+        with patch("murl.auth.httpx.post") as mock_post:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "access_token": "new_at",
+                "expires_in": 3600,
+            }
+            mock_post.return_value = mock_resp
+
+            refresh_token(creds)
+
+            post_data = mock_post.call_args[1].get("data", {})
+            assert post_data["client_secret"] == "sec123"
+            assert post_data["resource"] == "https://mcp.example.com/mcp"
 
     def test_no_refresh_token(self):
         with pytest.raises(OAuthError, match="No refresh token"):
@@ -405,6 +484,11 @@ class TestDiscoverAuthServerMetadata:
 # ---------------------------------------------------------------------------
 
 class TestCanonicalResourceUri:
+    """MCP 2025-11-25 §Resource Parameter Implementation / RFC 8707 §2.
+
+    The canonical URI MUST NOT include fragments, SHOULD omit trailing slash
+    unless semantically significant, and SHOULD be the most specific URI.
+    """
 
     def test_simple(self):
         assert _canonical_resource_uri("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp"
@@ -415,8 +499,17 @@ class TestCanonicalResourceUri:
     def test_strips_query(self):
         assert _canonical_resource_uri("https://mcp.example.com/mcp?foo=bar") == "https://mcp.example.com/mcp"
 
-    def test_no_path(self):
-        assert _canonical_resource_uri("https://mcp.example.com") == "https://mcp.example.com/"
+    def test_no_path_no_trailing_slash(self):
+        """Spec SHOULD: use form without trailing slash (MCP 2025-11-25 §Canonical Server URI)."""
+        assert _canonical_resource_uri("https://mcp.example.com") == "https://mcp.example.com"
+
+    def test_preserves_explicit_path_slash(self):
+        """A trailing slash that was explicitly part of the URL is preserved."""
+        assert _canonical_resource_uri("https://mcp.example.com/") == "https://mcp.example.com/"
+
+    def test_with_port(self):
+        """Port is part of the canonical URI (spec example: https://mcp.example.com:8443)."""
+        assert _canonical_resource_uri("https://mcp.example.com:8443/mcp") == "https://mcp.example.com:8443/mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -424,6 +517,11 @@ class TestCanonicalResourceUri:
 # ---------------------------------------------------------------------------
 
 class TestAuthorize:
+    """MCP 2025-11-25 §Authorization Flow Steps — end-to-end flow tests.
+
+    Validates: discovery chain, PKCE enforcement, resource parameter (RFC 8707),
+    client registration priority, and scope selection strategy.
+    """
 
     def _mock_full_flow(self, mock_httpx_get, mock_httpx_post, mock_webbrowser, mock_server):
         """Set up mocks for a successful full OAuth flow."""

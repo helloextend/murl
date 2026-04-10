@@ -251,7 +251,8 @@ async def make_mcp_request(
                     click.echo(f"Server: {init_result.serverInfo.name} {init_result.serverInfo.version}", err=True)
                     click.echo("", err=True)
 
-                # MCP 2025-11-25 Lifecycle: only use capabilities that were successfully negotiated
+                # MCP 2025-11-25 §Lifecycle/Operation: both parties MUST only use
+                # capabilities that were successfully negotiated.
                 category = method.split('/')[0]
                 if category in ("tools", "resources", "prompts"):
                     if getattr(init_result.capabilities, category, None) is None:
@@ -511,6 +512,8 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                     is_401 = True
                     break
 
+            # MCP 2025-11-25 §Authorization Flow Steps: on 401, discover
+            # metadata via WWW-Authenticate, then run full OAuth flow.
             if not no_auth and is_401:
                 if verbose:
                     click.echo("Received 401 — initiating OAuth flow...", err=True)
@@ -520,6 +523,8 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
+            # MCP 2025-11-25 §Scope Challenge Handling: on 403 insufficient_scope,
+            # parse required scopes from WWW-Authenticate and re-authorize.
             elif not no_auth and is_403:
                 if verbose:
                     click.echo("Received 403 — insufficient scope, re-authorizing...", err=True)
