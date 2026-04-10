@@ -362,13 +362,16 @@ EXAMPLES:
   murl https://server.com/mcp/prompts/greeting -d name=Alice # Get prompt
 
 AUTHENTICATION:
-  OAuth 2.0 (RFC 7591) with PKCE is built in.
+  OAuth 2.0 with PKCE is built in (Dynamic Client Registration or pre-configured).
   Credentials auto-refresh. On 401, re-authenticates and retries once.
 
   murl --login https://server.com/mcp/tools    # First-time auth (opens browser)
   murl https://server.com/mcp/tools            # Uses stored token
   murl --no-auth https://server.com/mcp/tools  # Skip auth
   murl -H "Authorization: Bearer <tok>" <url>  # Manual token
+
+  Pre-configured OAuth:
+  murl --client-id ID --client-secret SECRET --callback-port 8080 <url>
 
   Credentials: ~/.murl/credentials/<hash>.json
 
@@ -379,6 +382,9 @@ OPTIONS:
   --format <json|toon>          Output format (default: json, toon for LLMs)
   --login                      Force OAuth re-authentication
   --no-auth                    Skip all authentication
+  --client-id <id>             Pre-registered OAuth client ID (skip DCR)
+  --client-secret <secret>     Pre-registered OAuth client secret
+  --callback-port <port>       Fixed port for OAuth callback redirect URI
   --version                    Version info
   --upgrade                    Self-upgrade via pip
   -h, --help                   This help
@@ -414,8 +420,14 @@ OUTPUT:
               help='Output format (default: json, toon = token-efficient for LLMs)')
 @click.option('--login', is_flag=True, help='Force OAuth re-authentication')
 @click.option('--no-auth', is_flag=True, help='Skip all authentication')
+@click.option('--client-id', default=None, help='Pre-registered OAuth client ID (skips dynamic registration)')
+@click.option('--client-secret', default=None, help='Pre-registered OAuth client secret')
+@click.option('--callback-port', default=None, type=int,
+              help='Fixed port for OAuth callback (must match registered redirect URI)')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
-         verbose: bool, output_format: Optional[str], login: bool, no_auth: bool):
+         verbose: bool, output_format: Optional[str], login: bool, no_auth: bool,
+         client_id: Optional[str], client_secret: Optional[str],
+         callback_port: Optional[int]):
     """murl - MCP Curl"""
     if url is None:
         output_error(
@@ -440,6 +452,15 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         headers = parse_headers(header_flags) if header_flags else {}
 
         # --- Auth ---
+        # Common kwargs for all authorize() calls
+        auth_kwargs = {}
+        if client_id:
+            auth_kwargs["client_id"] = client_id
+        if client_secret:
+            auth_kwargs["client_secret"] = client_secret
+        if callback_port:
+            auth_kwargs["callback_port"] = callback_port
+
         has_auth_header = any(k.lower() == 'authorization' for k in headers)
         if not no_auth and not has_auth_header:
             if login:
@@ -453,11 +474,11 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                         creds = refresh_token(creds)
                         save_credentials(base_url, creds)
                     except OAuthError:
-                        creds = authorize(base_url)
+                        creds = authorize(base_url, **auth_kwargs)
                         save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
             elif login:
-                creds = authorize(base_url)
+                creds = authorize(base_url, **auth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
 
@@ -495,7 +516,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                     click.echo("Received 401 — initiating OAuth flow...", err=True)
                     if www_auth_header:
                         click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
-                creds = authorize(base_url, www_authenticate=www_auth_header)
+                creds = authorize(base_url, www_authenticate=www_auth_header, **auth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
@@ -509,7 +530,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                 if www_auth_header:
                     www_params = parse_www_authenticate(www_auth_header)
                     scope_to_request = www_params.get("scope")
-                creds = authorize(base_url, www_authenticate=www_auth_header, scope=scope_to_request)
+                creds = authorize(base_url, www_authenticate=www_auth_header, scope=scope_to_request, **auth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))

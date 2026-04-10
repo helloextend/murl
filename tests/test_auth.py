@@ -547,3 +547,72 @@ class TestAuthorize:
 
         with pytest.raises(OAuthError, match="does not support S256"):
             authorize("https://example.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_preconfigured_credentials_skip_registration(self, mock_get, mock_post, mock_browser, mock_server):
+        """Pre-configured client_id skips Dynamic Client Registration."""
+        meta_resp = MagicMock()
+        meta_resp.status_code = 200
+        meta_resp.json.return_value = {
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+            # No registration_endpoint — should still work with pre-configured creds
+        }
+        mock_get.return_value = meta_resp
+
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.json.return_value = {
+            "access_token": "at_preconfig",
+            "refresh_token": "rt_preconfig",
+            "expires_in": 3600,
+        }
+        mock_post.return_value = token_resp
+        mock_browser.return_value = True
+        mock_server.return_value = "test_auth_code"
+
+        creds = authorize(
+            "https://example.com/mcp",
+            client_id="my-app-id",
+            client_secret="my-app-secret",
+            callback_port=8080,
+        )
+
+        assert creds["access_token"] == "at_preconfig"
+        assert creds["client_id"] == "my-app-id"
+
+        # Only one POST (token exchange) — no registration POST
+        assert mock_post.call_count == 1
+
+        # Verify the auth URL uses the pre-configured client_id and fixed port
+        auth_url = mock_browser.call_args[0][0]
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(auth_url).query)
+        assert params["client_id"] == ["my-app-id"]
+        assert params["redirect_uri"] == ["http://127.0.0.1:8080/callback"]
+
+        # Verify token exchange includes client_secret
+        token_data = mock_post.call_args[1].get("data", {})
+        assert token_data["client_secret"] == "my-app-secret"
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_no_registration_and_no_client_id_raises(self, mock_get, mock_post, mock_browser, mock_server):
+        """Without pre-configured creds or a registration endpoint, authorize fails."""
+        meta_resp = MagicMock()
+        meta_resp.status_code = 200
+        meta_resp.json.return_value = {
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+            # No registration_endpoint
+        }
+        mock_get.return_value = meta_resp
+
+        with pytest.raises(OAuthError, match="--client-id"):
+            authorize("https://example.com/mcp")

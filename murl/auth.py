@@ -353,13 +353,15 @@ def _canonical_resource_uri(server_url: str) -> str:
 
 
 def authorize(server_url: str, www_authenticate: Optional[str] = None,
-              scope: Optional[str] = None) -> dict:
+              scope: Optional[str] = None, client_id: Optional[str] = None,
+              client_secret: Optional[str] = None,
+              callback_port: Optional[int] = None) -> dict:
     """Run the full OAuth flow and return credential dict.
 
     Follows MCP 2025-11-25 authorization spec:
       1. Protected Resource Metadata discovery (RFC 9728)
       2. Authorization Server Metadata discovery (RFC 8414 + OIDC)
-      3. Dynamic Client Registration (RFC 7591)
+      3. Client registration (pre-configured or Dynamic Client Registration)
       4. PKCE browser auth with resource parameter (RFC 8707)
       5. Token exchange with resource parameter
 
@@ -367,6 +369,10 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
         server_url: The MCP server base URL.
         www_authenticate: Optional WWW-Authenticate header value from a 401 response.
         scope: Optional scope string to request (from WWW-Authenticate or resource metadata).
+        client_id: Optional pre-registered OAuth client ID. Skips Dynamic Client Registration.
+        client_secret: Optional pre-registered OAuth client secret.
+        callback_port: Optional fixed port for the OAuth callback server.
+            Required when using pre-registered credentials with a fixed redirect URI.
 
     Returns dict with: client_id, client_secret, access_token, refresh_token,
     expires_at, token_endpoint, registration_endpoint, server_url, resource_uri.
@@ -414,12 +420,6 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     token_endpoint = meta["token_endpoint"]
     reg_endpoint = meta.get("registration_endpoint")
 
-    if not reg_endpoint:
-        raise OAuthError(
-            "Server does not advertise a registration endpoint. "
-            "Manual client registration may be required."
-        )
-
     # Verify PKCE support (MCP 2025-11-25 spec requirement)
     challenge_methods = meta.get("code_challenge_methods_supported")
     if challenge_methods is None:
@@ -432,19 +432,31 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
             "Authorization server does not support S256 PKCE code challenge method"
         )
 
-    # --- Step 2: Pick a random port for the callback ---
+    # --- Step 2: Callback port ---
     import socket
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
+    if callback_port:
+        port = callback_port
+    else:
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
 
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    # --- Step 3: Dynamic client registration ---
-    click.echo("Registering client...", err=True)
-    reg = register_client(reg_endpoint, redirect_uri)
-    client_id = reg["client_id"]
-    client_secret = reg.get("client_secret")
+    # --- Step 3: Client registration ---
+    # Priority per MCP spec: pre-configured > Dynamic Client Registration
+    if client_id:
+        click.echo("Using pre-configured client credentials...", err=True)
+    else:
+        if not reg_endpoint:
+            raise OAuthError(
+                "Server does not advertise a registration endpoint. "
+                "Use --client-id to provide pre-registered credentials."
+            )
+        click.echo("Registering client...", err=True)
+        reg = register_client(reg_endpoint, redirect_uri)
+        client_id = reg["client_id"]
+        client_secret = reg.get("client_secret")
 
     # --- Step 4: PKCE + authorization URL with resource parameter (RFC 8707) ---
     code_verifier, code_challenge = _generate_pkce()
