@@ -670,3 +670,110 @@ def test_cli_no_auth_skips_all_auth(mcp_server):
     assert not mock_get.called, "get_credentials should NOT be called with --no-auth"
     assert not mock_auth.called, "authorize should NOT be called with --no-auth"
     assert result.exit_code == 0
+
+
+# --- TOON format tests ---
+
+
+def test_toon_output_tools_list(mcp_server):
+    """--format toon outputs TOON format for tools/list."""
+    runner = CliRunner()
+    result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+
+    assert result.exit_code == 0
+    output = result.output.strip()
+    # Should contain tool names from test server
+    assert 'echo' in output
+    # Should NOT be valid JSON (it's TOON)
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)
+
+
+def test_toon_output_tool_call(mcp_server):
+    """--format toon outputs TOON format for tool call results."""
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        f"{mcp_server}/tools/echo",
+        "-d", "message=hello",
+        "--format", "toon", "--no-auth"
+    ])
+
+    assert result.exit_code == 0
+    output = result.output.strip()
+    assert 'hello' in output
+    # Verify output is TOON, not passthrough JSON
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(output)
+
+
+def test_toon_format_verbose_mutually_exclusive(mcp_server):
+    """--format and --verbose together should error."""
+    runner = CliRunner()
+    result = runner.invoke(main, [
+        f"{mcp_server}/tools", "--format", "toon", "-v", "--no-auth"
+    ])
+
+    assert result.exit_code == 2
+    error_obj = json.loads(result.output.strip())
+    assert error_obj["error"] == "INVALID_ARGUMENT"
+    assert "mutually exclusive" in error_obj["message"]
+
+
+def test_toon_roundtrip_tools_list(mcp_server):
+    """TOON output can be decoded back to the original data."""
+    from toon import decode as toon_decode
+
+    runner = CliRunner()
+
+    # Get JSON output
+    json_result = runner.invoke(main, [f"{mcp_server}/tools", "--no-auth"])
+    json_data = parse_ndjson(json_result.output)
+
+    # Get TOON output
+    toon_result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+    toon_data = toon_decode(toon_result.output.strip())
+
+    assert toon_data == json_data
+
+
+def test_toon_missing_dependency(mcp_server):
+    """--format toon with missing python-toon shows helpful error."""
+    from unittest.mock import patch
+
+    runner = CliRunner()
+    with patch("murl.cli.toon_encode", None):
+        result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+
+    assert result.exit_code == 1
+    error_obj = json.loads(result.output.strip())
+    assert error_obj["error"] == "MISSING_DEPENDENCY"
+    assert "mcp-curl[toon]" in error_obj["suggestion"]
+
+
+def test_toon_nested_objects(mcp_server):
+    """TOON handles tools with nested inputSchema correctly."""
+    from toon import decode as toon_decode
+
+    runner = CliRunner()
+    toon_result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+
+    assert toon_result.exit_code == 0
+    decoded = toon_decode(toon_result.output.strip())
+
+    # Verify nested inputSchema survived the roundtrip
+    tools_with_schema = [t for t in decoded if 'inputSchema' in t]
+    assert len(tools_with_schema) > 0
+    for tool in tools_with_schema:
+        assert isinstance(tool['inputSchema'], dict)
+
+
+def test_toon_empty_result(mcp_server):
+    """TOON handles empty list results without error."""
+    from unittest.mock import patch, AsyncMock
+
+    runner = CliRunner()
+    with patch("murl.cli.make_mcp_request", new_callable=AsyncMock, return_value=[]):
+        result = runner.invoke(main, [f"{mcp_server}/tools", "--format", "toon", "--no-auth"])
+
+    assert result.exit_code == 0
+    assert '[0]:' in result.output

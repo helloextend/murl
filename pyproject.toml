@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-curl"
-version = "0.3.2"
+version = "0.4.0"
 description = "A curl-like CLI tool for interacting with Model Context Protocol (MCP) servers"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,10 +35,14 @@ Repository = "https://github.com/turlockmike/murl"
 Issues = "https://github.com/turlockmike/murl/issues"
 
 [project.optional-dependencies]
+toon = [
+    "python-toon>=0.1.3,<1.0.0",
+]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "requests>=2.31.0",
+    "python-toon>=0.1.3,<1.0.0",  # keep in sync with [toon] extras above
 ]
 
 [project.scripts]
