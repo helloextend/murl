@@ -1,9 +1,18 @@
-"""OAuth 2.0 Dynamic Client Registration (RFC 7591) with PKCE."""
+"""OAuth 2.0 authorization for MCP (2025-11-25 spec).
+
+Implements:
+- Protected Resource Metadata discovery (RFC 9728)
+- Authorization Server Metadata with OIDC fallback (RFC 8414)
+- Dynamic Client Registration (RFC 7591)
+- PKCE with S256 (OAuth 2.1)
+- Resource Indicators (RFC 8707)
+"""
 
 import base64
 import hashlib
 import html
 import json
+import re
 import secrets
 import threading
 import time
@@ -22,47 +31,186 @@ class OAuthError(Exception):
     """Raised when an OAuth operation fails."""
 
 
+# ---------------------------------------------------------------------------
+# WWW-Authenticate header parsing
+# ---------------------------------------------------------------------------
+
+def parse_www_authenticate(header_value: str) -> dict:
+    """Parse a WWW-Authenticate Bearer header into a dict of parameters.
+
+    Handles: Bearer resource_metadata="...", scope="...", error="..."
+    Returns dict with keys like resource_metadata, scope, error, error_description.
+    """
+    result = {}
+    # Strip the "Bearer" scheme prefix if present
+    value = header_value.strip()
+    if value.lower().startswith("bearer"):
+        value = value[len("bearer"):].strip()
+        # Handle case where there's nothing after Bearer (just "Bearer")
+        if not value:
+            return result
+
+    # Parse key="value" pairs (values may or may not be quoted)
+    for match in re.finditer(r'(\w+)\s*=\s*"([^"]*)"', value):
+        result[match.group(1)] = match.group(2)
+    # Also handle unquoted values
+    for match in re.finditer(r'(\w+)\s*=\s*([^",\s]+)', value):
+        key = match.group(1)
+        if key not in result:  # quoted takes precedence
+            result[key] = match.group(2)
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Discovery: Protected Resource Metadata (RFC 9728)
+# ---------------------------------------------------------------------------
+
+def discover_resource_metadata(server_url: str, resource_metadata_url: Optional[str] = None) -> dict:
+    """Fetch Protected Resource Metadata per RFC 9728.
+
+    If resource_metadata_url is provided (from WWW-Authenticate header), use it directly.
+    Otherwise, try well-known URIs:
+      1. /.well-known/oauth-protected-resource/<path> (path-aware)
+      2. /.well-known/oauth-protected-resource (root)
+
+    Returns the metadata dict, which must contain 'authorization_servers'.
+    Raises OAuthError if discovery fails.
+    """
+    urls_to_try = []
+
+    if resource_metadata_url:
+        urls_to_try.append(resource_metadata_url)
+    else:
+        parsed = urllib.parse.urlparse(server_url)
+        base = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path.rstrip("/")
+
+        if path:
+            urls_to_try.append(f"{base}/.well-known/oauth-protected-resource{path}")
+        urls_to_try.append(f"{base}/.well-known/oauth-protected-resource")
+
+    for url in urls_to_try:
+        try:
+            resp = httpx.get(url, follow_redirects=True, timeout=10)
+        except httpx.HTTPError:
+            continue
+
+        if resp.status_code == 200:
+            try:
+                meta = resp.json()
+            except json.JSONDecodeError:
+                continue
+            if isinstance(meta, dict) and "authorization_servers" in meta:
+                return meta
+            # Valid JSON but missing required field — keep trying
+            continue
+
+    raise OAuthError(
+        "Could not discover Protected Resource Metadata (RFC 9728). "
+        "The server may not support OAuth, or the well-known endpoint is unreachable."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Discovery: Authorization Server Metadata (RFC 8414 + OIDC)
+# ---------------------------------------------------------------------------
+
+def discover_auth_server_metadata(issuer_url: str) -> dict:
+    """Fetch Authorization Server Metadata with OIDC Discovery fallback.
+
+    Per MCP 2025-11-25 spec, clients MUST try:
+      For issuer with path (e.g. https://auth.example.com/tenant1):
+        1. /.well-known/oauth-authorization-server/tenant1  (RFC 8414)
+        2. /.well-known/openid-configuration/tenant1        (OIDC path insertion)
+        3. /tenant1/.well-known/openid-configuration        (OIDC path append)
+
+      For issuer without path (e.g. https://auth.example.com):
+        1. /.well-known/oauth-authorization-server           (RFC 8414)
+        2. /.well-known/openid-configuration                 (OIDC)
+    """
+    parsed = urllib.parse.urlparse(issuer_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
+
+    urls_to_try = []
+    if path:
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server{path}")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration{path}")
+        urls_to_try.append(f"{base}{path}/.well-known/openid-configuration")
+    else:
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration")
+
+    for url in urls_to_try:
+        try:
+            resp = httpx.get(url, follow_redirects=True, timeout=10)
+        except httpx.HTTPError:
+            continue
+
+        if resp.status_code == 200:
+            try:
+                meta = resp.json()
+            except json.JSONDecodeError:
+                continue
+            if isinstance(meta, dict) and "token_endpoint" in meta:
+                return meta
+
+    raise OAuthError(
+        f"Could not discover Authorization Server Metadata for {issuer_url}. "
+        "Tried OAuth 2.0 (RFC 8414) and OpenID Connect discovery endpoints."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Legacy discovery (kept for backwards compat with servers that don't
+# implement RFC 9728 yet)
+# ---------------------------------------------------------------------------
+
 def _auth_base_url(server_url: str) -> str:
-    """Extract scheme + host from server URL (strip path per MCP spec)."""
+    """Extract scheme + host from server URL."""
     parsed = urllib.parse.urlparse(server_url)
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def discover_metadata(server_url: str) -> dict:
-    """Fetch OAuth 2.0 Authorization Server Metadata.
+    """Legacy: fetch OAuth 2.0 Authorization Server Metadata directly.
 
-    Tries /.well-known/oauth-authorization-server first.
-    Falls back to sensible defaults if 404.
+    Tries /.well-known/oauth-authorization-server first, with OIDC fallback.
+    Falls back to sensible defaults if both 404.
     """
-    base = _auth_base_url(server_url)
-    url = f"{base}/.well-known/oauth-authorization-server"
+    parsed = urllib.parse.urlparse(server_url)
+    base = f"{parsed.scheme}://{parsed.netloc}"
+    path = parsed.path.rstrip("/")
 
-    try:
-        resp = httpx.get(url, follow_redirects=True, timeout=10)
-    except httpx.HTTPError:
-        # Network error — fall back to defaults
-        return {
-            "authorization_endpoint": f"{base}/authorize",
-            "token_endpoint": f"{base}/token",
-            "registration_endpoint": f"{base}/register",
-        }
+    # Try RFC 8414 then OIDC, path-aware
+    urls_to_try = []
+    if path:
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server{path}")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration{path}")
+        urls_to_try.append(f"{base}{path}/.well-known/openid-configuration")
+    else:
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration")
 
-    if resp.status_code == 200:
+    for url in urls_to_try:
         try:
-            return resp.json()
-        except json.JSONDecodeError as exc:
-            raise OAuthError("Invalid JSON in OAuth metadata response") from exc
+            resp = httpx.get(url, follow_redirects=True, timeout=10)
+        except httpx.HTTPError:
+            continue
 
-    if resp.status_code == 404:
-        return {
-            "authorization_endpoint": f"{base}/authorize",
-            "token_endpoint": f"{base}/token",
-            "registration_endpoint": f"{base}/register",
-        }
+        if resp.status_code == 200:
+            try:
+                return resp.json()
+            except json.JSONDecodeError as exc:
+                raise OAuthError("Invalid JSON in OAuth metadata response") from exc
 
-    raise OAuthError(
-        f"Failed to fetch OAuth metadata ({resp.status_code}): {resp.text}"
-    )
+    # All attempts failed — fall back to defaults
+    return {
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
+    }
 
 
 def register_client(registration_endpoint: str, redirect_uri: str) -> dict:
@@ -192,20 +340,76 @@ def _generate_pkce() -> tuple:
 # Public API
 # ---------------------------------------------------------------------------
 
-def authorize(server_url: str) -> dict:
+def _canonical_resource_uri(server_url: str) -> str:
+    """Build the canonical resource URI for RFC 8707 resource parameter.
+
+    Per the spec: scheme + authority + path, no fragment, no trailing slash ambiguity.
+    """
+    parsed = urllib.parse.urlparse(server_url)
+    # Reconstruct without fragment or query
+    return urllib.parse.urlunparse((
+        parsed.scheme, parsed.netloc, parsed.path or "/", "", "", ""
+    ))
+
+
+def authorize(server_url: str, www_authenticate: Optional[str] = None,
+              scope: Optional[str] = None) -> dict:
     """Run the full OAuth flow and return credential dict.
 
-    Steps: metadata discovery -> client registration -> PKCE browser auth -> token exchange.
+    Follows MCP 2025-11-25 authorization spec:
+      1. Protected Resource Metadata discovery (RFC 9728)
+      2. Authorization Server Metadata discovery (RFC 8414 + OIDC)
+      3. Dynamic Client Registration (RFC 7591)
+      4. PKCE browser auth with resource parameter (RFC 8707)
+      5. Token exchange with resource parameter
 
-    The returned dict contains: client_id, client_secret (maybe None),
-    access_token, refresh_token, expires_at, token_endpoint,
-    registration_endpoint, server_url.
+    Args:
+        server_url: The MCP server base URL.
+        www_authenticate: Optional WWW-Authenticate header value from a 401 response.
+        scope: Optional scope string to request (from WWW-Authenticate or resource metadata).
+
+    Returns dict with: client_id, client_secret, access_token, refresh_token,
+    expires_at, token_endpoint, registration_endpoint, server_url, resource_uri.
     """
     import click
 
-    # 1. Metadata
+    resource_uri = _canonical_resource_uri(server_url)
+
+    # --- Step 1: Discovery ---
+    # Try the full RFC 9728 discovery chain first. If that fails (server doesn't
+    # implement Protected Resource Metadata), fall back to legacy direct discovery.
     click.echo("Discovering OAuth metadata...", err=True)
-    meta = discover_metadata(server_url)
+
+    www_auth_params = parse_www_authenticate(www_authenticate) if www_authenticate else {}
+    resource_metadata_url = www_auth_params.get("resource_metadata")
+
+    # Scope priority: explicit param > WWW-Authenticate > resource metadata
+    if not scope and www_auth_params.get("scope"):
+        scope = www_auth_params["scope"]
+
+    auth_server_meta = None
+    try:
+        # RFC 9728: fetch Protected Resource Metadata
+        resource_meta = discover_resource_metadata(server_url, resource_metadata_url)
+
+        # Extract scope from resource metadata if not already set
+        if not scope and resource_meta.get("scopes_supported"):
+            scope = " ".join(resource_meta["scopes_supported"])
+
+        # Get the first authorization server
+        auth_servers = resource_meta.get("authorization_servers", [])
+        if not auth_servers:
+            raise OAuthError("Protected Resource Metadata has empty authorization_servers")
+
+        issuer_url = auth_servers[0]
+
+        # Fetch auth server metadata (RFC 8414 + OIDC fallback)
+        auth_server_meta = discover_auth_server_metadata(issuer_url)
+    except OAuthError:
+        # Fallback: legacy direct discovery (for servers not yet on 2025-11-25)
+        auth_server_meta = discover_metadata(server_url)
+
+    meta = auth_server_meta
     auth_endpoint = meta["authorization_endpoint"]
     token_endpoint = meta["token_endpoint"]
     reg_endpoint = meta.get("registration_endpoint")
@@ -216,7 +420,19 @@ def authorize(server_url: str) -> dict:
             "Manual client registration may be required."
         )
 
-    # 2. Pick a random port for the callback
+    # Verify PKCE support (MCP 2025-11-25 spec requirement)
+    challenge_methods = meta.get("code_challenge_methods_supported")
+    if challenge_methods is None:
+        raise OAuthError(
+            "Authorization server does not advertise PKCE support "
+            "(code_challenge_methods_supported). Cannot proceed securely."
+        )
+    if "S256" not in challenge_methods:
+        raise OAuthError(
+            "Authorization server does not support S256 PKCE code challenge method"
+        )
+
+    # --- Step 2: Pick a random port for the callback ---
     import socket
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -224,13 +440,13 @@ def authorize(server_url: str) -> dict:
 
     redirect_uri = f"http://127.0.0.1:{port}/callback"
 
-    # 3. Dynamic client registration
+    # --- Step 3: Dynamic client registration ---
     click.echo("Registering client...", err=True)
     reg = register_client(reg_endpoint, redirect_uri)
     client_id = reg["client_id"]
     client_secret = reg.get("client_secret")
 
-    # 4. PKCE + authorization URL
+    # --- Step 4: PKCE + authorization URL with resource parameter (RFC 8707) ---
     code_verifier, code_challenge = _generate_pkce()
     state = secrets.token_urlsafe(32)
 
@@ -241,13 +457,16 @@ def authorize(server_url: str) -> dict:
         "code_challenge": code_challenge,
         "code_challenge_method": "S256",
         "state": state,
+        "resource": resource_uri,
     }
+    if scope:
+        auth_params["scope"] = scope
     auth_url = f"{auth_endpoint}?{urllib.parse.urlencode(auth_params)}"
 
     click.echo("Opening browser for authorization...", err=True)
     webbrowser.open(auth_url)
 
-    # 5. Wait for callback in a background thread so we can show a message
+    # --- Step 5: Wait for callback ---
     code_result = [None]
     error_result = [None]
 
@@ -269,7 +488,7 @@ def authorize(server_url: str) -> dict:
 
     auth_code = code_result[0]
 
-    # 6. Token exchange
+    # --- Step 6: Token exchange with resource parameter (RFC 8707) ---
     click.echo("Exchanging authorization code for token...", err=True)
     token_data = {
         "grant_type": "authorization_code",
@@ -277,6 +496,7 @@ def authorize(server_url: str) -> dict:
         "client_id": client_id,
         "redirect_uri": redirect_uri,
         "code_verifier": code_verifier,
+        "resource": resource_uri,
     }
     if client_secret:
         token_data["client_secret"] = client_secret
@@ -302,6 +522,7 @@ def authorize(server_url: str) -> dict:
         "token_endpoint": token_endpoint,
         "registration_endpoint": reg_endpoint,
         "server_url": server_url,
+        "resource_uri": resource_uri,
     }
     click.echo("Authorization successful!", err=True)
     return creds

@@ -9,8 +9,12 @@ import httpx
 
 from murl.auth import (
     _auth_base_url,
+    _canonical_resource_uri,
     _generate_pkce,
     discover_metadata,
+    discover_resource_metadata,
+    discover_auth_server_metadata,
+    parse_www_authenticate,
     register_client,
     authorize,
     refresh_token,
@@ -109,7 +113,9 @@ class TestDiscoverMetadata:
 
             result = discover_metadata("https://example.com/mcp")
             assert result == meta
-            mock_get.assert_called_once()
+            # First URL tried should be path-aware RFC 8414
+            first_url = mock_get.call_args_list[0][0][0]
+            assert "/.well-known/oauth-authorization-server/mcp" in first_url
 
     def test_fallback_on_404(self):
         with patch("murl.auth.httpx.get") as mock_get:
@@ -127,15 +133,19 @@ class TestDiscoverMetadata:
             result = discover_metadata("https://example.com/mcp")
             assert "authorization_endpoint" in result
 
-    def test_error_on_500(self):
+    def test_fallback_on_500(self):
+        """All endpoints returning 500 falls back to defaults (tries multiple URLs)."""
         with patch("murl.auth.httpx.get") as mock_get:
             mock_resp = MagicMock()
             mock_resp.status_code = 500
             mock_resp.text = "Internal Server Error"
             mock_get.return_value = mock_resp
 
-            with pytest.raises(OAuthError, match="Failed to fetch OAuth metadata"):
-                discover_metadata("https://example.com/mcp")
+            result = discover_metadata("https://example.com/mcp")
+            assert "/authorize" in result["authorization_endpoint"]
+            assert "/token" in result["token_endpoint"]
+            # Should have tried multiple URLs (RFC 8414 + OIDC)
+            assert mock_get.call_count >= 2
 
 
 # ---------------------------------------------------------------------------
@@ -226,6 +236,190 @@ class TestRefreshToken:
 
 
 # ---------------------------------------------------------------------------
+# parse_www_authenticate
+# ---------------------------------------------------------------------------
+
+class TestParseWwwAuthenticate:
+
+    def test_bearer_with_resource_metadata(self):
+        header = 'Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource", scope="files:read"'
+        result = parse_www_authenticate(header)
+        assert result["resource_metadata"] == "https://mcp.example.com/.well-known/oauth-protected-resource"
+        assert result["scope"] == "files:read"
+
+    def test_bearer_with_error(self):
+        header = 'Bearer error="insufficient_scope", scope="files:read files:write", error_description="Need write access"'
+        result = parse_www_authenticate(header)
+        assert result["error"] == "insufficient_scope"
+        assert result["scope"] == "files:read files:write"
+        assert result["error_description"] == "Need write access"
+
+    def test_bare_bearer(self):
+        result = parse_www_authenticate("Bearer")
+        assert result == {}
+
+    def test_empty(self):
+        result = parse_www_authenticate("")
+        assert result == {}
+
+
+# ---------------------------------------------------------------------------
+# discover_resource_metadata (RFC 9728)
+# ---------------------------------------------------------------------------
+
+class TestDiscoverResourceMetadata:
+
+    def test_from_explicit_url(self):
+        meta = {
+            "resource": "https://mcp.example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = meta
+            mock_get.return_value = mock_resp
+
+            result = discover_resource_metadata(
+                "https://mcp.example.com/mcp",
+                resource_metadata_url="https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+            )
+            assert result["authorization_servers"] == ["https://auth.example.com"]
+            # Should use the explicit URL first
+            mock_get.assert_called_once_with(
+                "https://mcp.example.com/.well-known/oauth-protected-resource/mcp",
+                follow_redirects=True, timeout=10
+            )
+
+    def test_well_known_path_aware(self):
+        meta = {
+            "resource": "https://mcp.example.com/mcp",
+            "authorization_servers": ["https://auth.example.com"],
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = meta
+            mock_get.return_value = mock_resp
+
+            result = discover_resource_metadata("https://mcp.example.com/mcp")
+            assert result["authorization_servers"] == ["https://auth.example.com"]
+            first_url = mock_get.call_args_list[0][0][0]
+            assert first_url == "https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+
+    def test_fallback_to_root(self):
+        """If path-aware URL fails, try root well-known."""
+        with patch("murl.auth.httpx.get") as mock_get:
+            not_found = MagicMock()
+            not_found.status_code = 404
+            root_meta = MagicMock()
+            root_meta.status_code = 200
+            root_meta.json.return_value = {
+                "authorization_servers": ["https://auth.example.com"],
+            }
+            mock_get.side_effect = [not_found, root_meta]
+
+            result = discover_resource_metadata("https://mcp.example.com/mcp")
+            assert result["authorization_servers"] == ["https://auth.example.com"]
+            assert mock_get.call_count == 2
+
+    def test_all_fail_raises(self):
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 404
+            mock_get.return_value = mock_resp
+
+            with pytest.raises(OAuthError, match="Protected Resource Metadata"):
+                discover_resource_metadata("https://mcp.example.com/mcp")
+
+
+# ---------------------------------------------------------------------------
+# discover_auth_server_metadata (RFC 8414 + OIDC)
+# ---------------------------------------------------------------------------
+
+class TestDiscoverAuthServerMetadata:
+
+    def test_rfc8414_success(self):
+        meta = {
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = meta
+            mock_get.return_value = mock_resp
+
+            result = discover_auth_server_metadata("https://auth.example.com")
+            assert result["token_endpoint"] == "https://auth.example.com/token"
+
+    def test_oidc_fallback(self):
+        """RFC 8414 fails, OIDC discovery succeeds."""
+        meta = {
+            "issuer": "https://auth.example.com",
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            not_found = MagicMock()
+            not_found.status_code = 404
+            oidc_resp = MagicMock()
+            oidc_resp.status_code = 200
+            oidc_resp.json.return_value = meta
+            mock_get.side_effect = [not_found, oidc_resp]
+
+            result = discover_auth_server_metadata("https://auth.example.com")
+            assert result["token_endpoint"] == "https://auth.example.com/token"
+            assert mock_get.call_count == 2
+
+    def test_with_path_component(self):
+        """Issuer URL with path uses path-insertion for both RFC 8414 and OIDC."""
+        meta = {
+            "issuer": "https://auth.example.com/tenant1",
+            "authorization_endpoint": "https://auth.example.com/tenant1/authorize",
+            "token_endpoint": "https://auth.example.com/tenant1/token",
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = meta
+            mock_get.return_value = mock_resp
+
+            result = discover_auth_server_metadata("https://auth.example.com/tenant1")
+            first_url = mock_get.call_args_list[0][0][0]
+            assert first_url == "https://auth.example.com/.well-known/oauth-authorization-server/tenant1"
+
+    def test_all_fail_raises(self):
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 404
+            mock_get.return_value = mock_resp
+
+            with pytest.raises(OAuthError, match="Could not discover Authorization Server"):
+                discover_auth_server_metadata("https://auth.example.com")
+
+
+# ---------------------------------------------------------------------------
+# canonical_resource_uri
+# ---------------------------------------------------------------------------
+
+class TestCanonicalResourceUri:
+
+    def test_simple(self):
+        assert _canonical_resource_uri("https://mcp.example.com/mcp") == "https://mcp.example.com/mcp"
+
+    def test_strips_fragment(self):
+        assert _canonical_resource_uri("https://mcp.example.com/mcp#frag") == "https://mcp.example.com/mcp"
+
+    def test_strips_query(self):
+        assert _canonical_resource_uri("https://mcp.example.com/mcp?foo=bar") == "https://mcp.example.com/mcp"
+
+    def test_no_path(self):
+        assert _canonical_resource_uri("https://mcp.example.com") == "https://mcp.example.com/"
+
+
+# ---------------------------------------------------------------------------
 # Full authorize flow (mocked)
 # ---------------------------------------------------------------------------
 
@@ -240,6 +434,7 @@ class TestAuthorize:
             "authorization_endpoint": "https://auth.example.com/authorize",
             "token_endpoint": "https://auth.example.com/token",
             "registration_endpoint": "https://auth.example.com/register",
+            "code_challenge_methods_supported": ["S256"],
         }
         mock_httpx_get.return_value = meta_resp
 
@@ -277,6 +472,7 @@ class TestAuthorize:
         assert creds["client_id"] == "cid_test"
         assert creds["expires_at"] > time.time()
         assert creds["server_url"] == "https://example.com/mcp"
+        assert creds["resource_uri"] == "https://example.com/mcp"
 
         # Verify browser was opened with correct params
         mock_browser.assert_called_once()
@@ -288,6 +484,13 @@ class TestAuthorize:
         assert params["code_challenge_method"] == ["S256"]
         assert "state" in params
         assert "code_challenge" in params
+        # RFC 8707: resource parameter must be present
+        assert params["resource"] == ["https://example.com/mcp"]
+
+        # Verify token exchange also included resource parameter
+        token_call = mock_post.call_args_list[1]  # second POST is token exchange
+        token_data = token_call[1].get("data", {})
+        assert token_data["resource"] == "https://example.com/mcp"
 
     @patch("murl.auth._run_callback_server")
     @patch("murl.auth.webbrowser.open")
@@ -299,9 +502,48 @@ class TestAuthorize:
         meta_resp.json.return_value = {
             "authorization_endpoint": "https://auth.example.com/authorize",
             "token_endpoint": "https://auth.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
             # No registration_endpoint
         }
         mock_get.return_value = meta_resp
 
         with pytest.raises(OAuthError, match="registration endpoint"):
+            authorize("https://example.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_pkce_missing_from_metadata(self, mock_get, mock_post, mock_browser, mock_server):
+        """authorize() must refuse if code_challenge_methods_supported is absent."""
+        meta_resp = MagicMock()
+        meta_resp.status_code = 200
+        meta_resp.json.return_value = {
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "registration_endpoint": "https://auth.example.com/register",
+            # No code_challenge_methods_supported
+        }
+        mock_get.return_value = meta_resp
+
+        with pytest.raises(OAuthError, match="does not advertise PKCE support"):
+            authorize("https://example.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_pkce_s256_not_supported(self, mock_get, mock_post, mock_browser, mock_server):
+        """authorize() must refuse if S256 is not in code_challenge_methods_supported."""
+        meta_resp = MagicMock()
+        meta_resp.status_code = 200
+        meta_resp.json.return_value = {
+            "authorization_endpoint": "https://auth.example.com/authorize",
+            "token_endpoint": "https://auth.example.com/token",
+            "registration_endpoint": "https://auth.example.com/register",
+            "code_challenge_methods_supported": ["plain"],
+        }
+        mock_get.return_value = meta_resp
+
+        with pytest.raises(OAuthError, match="does not support S256"):
             authorize("https://example.com/mcp")

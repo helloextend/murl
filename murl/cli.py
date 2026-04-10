@@ -20,7 +20,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from murl import __version__
 from murl.token_store import get_credentials, save_credentials, clear_credentials, is_expired
-from murl.auth import authorize, refresh_token, OAuthError
+from murl.auth import authorize, refresh_token, OAuthError, parse_www_authenticate
 
 # Optional TOON format support (pip install mcp-curl[toon])
 try:
@@ -161,12 +161,20 @@ def map_virtual_path_to_method(virtual_path: str, data: Dict[str, Any]) -> Tuple
         if len(parts) == 1:
             return 'resources/list', {}
         else:
-            file_path = '/'.join(parts[1:])
-            if not file_path or file_path == '':
+            resource_path = '/'.join(parts[1:])
+            if not resource_path or resource_path == '':
                 raise ValueError("Invalid resources path: path cannot be empty after /resources/")
-            if not file_path.startswith('/'):
-                file_path = '/' + file_path
-            uri = f'file://{file_path}'
+            # If the path looks like a URI scheme (contains ://), use it as-is.
+            # Otherwise, construct a file:// URI for backwards compatibility.
+            if '://' in resource_path:
+                uri = resource_path
+            else:
+                if not resource_path.startswith('/'):
+                    resource_path = '/' + resource_path
+                uri = f'file://{resource_path}'
+            # Allow -d uri=... to override the path-derived URI
+            if 'uri' in data:
+                uri = data.pop('uri')
             return 'resources/read', {'uri': uri, **data}
 
     elif category == 'prompts':
@@ -242,6 +250,18 @@ async def make_mcp_request(
                     click.echo(f"Protocol Version: {init_result.protocolVersion}", err=True)
                     click.echo(f"Server: {init_result.serverInfo.name} {init_result.serverInfo.version}", err=True)
                     click.echo("", err=True)
+
+                # MCP 2025-11-25 Lifecycle: only use capabilities that were successfully negotiated
+                category = method.split('/')[0]
+                if category in ("tools", "resources", "prompts"):
+                    if getattr(init_result.capabilities, category, None) is None:
+                        available = [
+                            cap for cap in ["tools", "resources", "prompts", "logging", "completions"]
+                            if getattr(init_result.capabilities, cap, None) is not None
+                        ]
+                        raise ValueError(
+                            f"Server does not support '{category}'. Supported: {', '.join(available)}"
+                        )
 
                 if method == 'tools/list':
                     result = await session.list_tools()
@@ -435,7 +455,7 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                     except OAuthError:
                         creds = authorize(base_url)
                         save_credentials(base_url, creds)
-                headers["Authorization"] = f"Bearer {creds['access_token']}"  # always set, whether refreshed or not
+                headers["Authorization"] = f"Bearer {creds['access_token']}"
             elif login:
                 creds = authorize(base_url)
                 save_credentials(base_url, creds)
@@ -445,18 +465,51 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         try:
             result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
         except (Exception, ExceptionGroup) as req_err:
-            err_str = str(req_err)
-            # Unwrap ExceptionGroup to check nested exceptions for 401
-            if isinstance(req_err, ExceptionGroup):
-                for exc in req_err.exceptions:
-                    exc_str = str(exc)
-                    if "401" in exc_str or "Unauthorized" in exc_str:
-                        err_str = exc_str
+            # Extract WWW-Authenticate header and 401 status from the exception chain.
+            # The MCP SDK raises httpx.HTTPStatusError (possibly wrapped in ExceptionGroup)
+            # which carries the full HTTP response including headers.
+            www_auth_header = None
+            is_401 = False
+            is_403 = False
+
+            exceptions = req_err.exceptions if isinstance(req_err, ExceptionGroup) else [req_err]
+            for exc in exceptions:
+                # httpx.HTTPStatusError has a .response attribute
+                if hasattr(exc, 'response') and hasattr(exc.response, 'status_code'):
+                    if exc.response.status_code == 401:
+                        is_401 = True
+                        www_auth_header = exc.response.headers.get("www-authenticate")
                         break
-            if not no_auth and ("401" in err_str or "Unauthorized" in err_str):
+                    if exc.response.status_code == 403:
+                        is_403 = True
+                        www_auth_header = exc.response.headers.get("www-authenticate")
+                        break
+                # Fallback: string matching for non-httpx exceptions
+                exc_str = str(exc)
+                if "401" in exc_str or "Unauthorized" in exc_str:
+                    is_401 = True
+                    break
+
+            if not no_auth and is_401:
                 if verbose:
                     click.echo("Received 401 — initiating OAuth flow...", err=True)
-                creds = authorize(base_url)
+                    if www_auth_header:
+                        click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
+                creds = authorize(base_url, www_authenticate=www_auth_header)
+                save_credentials(base_url, creds)
+                headers["Authorization"] = f"Bearer {creds['access_token']}"
+                result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
+            elif not no_auth and is_403:
+                if verbose:
+                    click.echo("Received 403 — insufficient scope, re-authorizing...", err=True)
+                    if www_auth_header:
+                        click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
+                # Parse scope from WWW-Authenticate
+                scope_to_request = None
+                if www_auth_header:
+                    www_params = parse_www_authenticate(www_auth_header)
+                    scope_to_request = www_params.get("scope")
+                creds = authorize(base_url, www_authenticate=www_auth_header, scope=scope_to_request)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
