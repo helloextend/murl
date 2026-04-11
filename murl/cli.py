@@ -106,19 +106,53 @@ def parse_data_value(value: str) -> Any:
     return value
 
 
+def _read_json_source(source: str) -> dict:
+    """Read a JSON object from stdin (@-) or a file (@path).
+
+    Follows the curl convention: -d @- reads stdin, -d @file reads a file.
+    The content must be a JSON object (dict), not an array or scalar.
+    """
+    path = source[1:]  # strip leading @
+    try:
+        if path == '-':
+            content = sys.stdin.read()
+        else:
+            with open(path) as f:
+                content = f.read()
+    except OSError as e:
+        raise ValueError(f"Cannot read {source}: {e}")
+
+    if not content.strip():
+        raise ValueError(f"Empty input from {source}")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON from {source}: {e}")
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"JSON from {source} must be an object, not {type(parsed).__name__}"
+        )
+    return parsed
+
+
 def parse_data_flags(data_flags: Tuple[str, ...]) -> Dict[str, Any]:
     """Parse -d/--data flags into a dictionary.
 
-    Note:
-        JSON objects (starting with '{') are merged into the result.
-        JSON arrays (starting with '[') are not supported as they don't
-        represent key-value pairs needed for MCP arguments.
+    Supports three formats (processed in order, later values override earlier):
+        - key=value       — simple key-value pair with type coercion
+        - {"key": "val"}  — inline JSON object, merged into result
+        - @-              — read JSON object from stdin (curl convention)
+        - @path           — read JSON object from a file
     """
     result = {}
 
     for data in data_flags:
         stripped = data.strip()
-        if stripped.startswith('{'):
+        if stripped.startswith('@'):
+            result.update(_read_json_source(stripped))
+        elif stripped.startswith('{'):
             try:
                 parsed = json.loads(data)
                 if not isinstance(parsed, dict):
@@ -338,8 +372,13 @@ DESCRIPTION:
 EXAMPLES:
   murl https://server.com/mcp/tools                         # List tools
   murl https://server.com/mcp/tools/echo -d message=hello   # Call tool
+  murl https://server.com/mcp/tools/echo -d @params.json    # Args from file
+  echo '{"message":"hi"}' | murl $S/tools/echo -d @-        # Args from stdin
   murl https://server.com/mcp/resources/path/to/file         # Read resource
   murl https://server.com/mcp/prompts/greeting -d name=Alice # Get prompt
+
+PIPELINES:
+  murl $S/tools/search -d q=foo | jq '{id:.[0].text}' | murl $S/tools/get -d @-
 
 AUTHENTICATION:
   OAuth 2.0 (RFC 7591) with PKCE is built in.
@@ -353,7 +392,7 @@ AUTHENTICATION:
   Credentials: ~/.murl/credentials/<hash>.json
 
 OPTIONS:
-  -d, --data <key=value|JSON>  Request data (repeatable)
+  -d, --data <key=value|JSON|@file|@->  Request data (repeatable)
   -H, --header <Key: Value>    HTTP header (repeatable)
   -v, --verbose                Pretty-print output, show request debug info
   --format <json|toon>          Output format (default: json, toon for LLMs)
