@@ -21,17 +21,50 @@ from murl.token_store import (
     save_credentials,
     clear_credentials,
     is_expired,
+    _keyring_available,
+    _KEYRING_SERVICE,
+    _key_for_url,
 )
 
+import json
+
 
 # ---------------------------------------------------------------------------
-# token_store tests
+# token_store tests — helpers
 # ---------------------------------------------------------------------------
 
-class TestTokenStore:
-    """Tests for credential persistence."""
+def _mock_keyring_get(store, key):
+    """In-memory keyring get."""
+    data = store.get((_KEYRING_SERVICE, key))
+    if data is None:
+        return None
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def _mock_keyring_set(store, key, creds):
+    """In-memory keyring set."""
+    store[(_KEYRING_SERVICE, key)] = json.dumps(creds)
+    return True
+
+
+def _mock_keyring_delete(store, key):
+    """In-memory keyring delete."""
+    store.pop((_KEYRING_SERVICE, key), None)
+
+
+def _disable_keyring(monkeypatch):
+    """Force the filesystem backend by making keyring appear unavailable."""
+    monkeypatch.setattr("murl.token_store._keyring_available", lambda: False)
+
+
+class TestTokenStoreFilesystem:
+    """Tests for credential persistence via filesystem (no keyring)."""
 
     def test_roundtrip(self, tmp_path, monkeypatch):
+        _disable_keyring(monkeypatch)
         monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
         url = "https://example.com/mcp"
         creds = {"access_token": "tok123", "expires_at": time.time() + 3600}
@@ -41,8 +74,11 @@ class TestTokenStore:
         loaded = get_credentials(url)
         assert loaded["access_token"] == "tok123"
         assert loaded["server_url"] == url
+        # Verify it's on disk
+        assert len(list(tmp_path.glob("*.json"))) == 1
 
     def test_clear(self, tmp_path, monkeypatch):
+        _disable_keyring(monkeypatch)
         monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
         url = "https://example.com/mcp"
         save_credentials(url, {"access_token": "tok"})
@@ -50,20 +86,110 @@ class TestTokenStore:
         assert get_credentials(url) is None
 
     def test_clear_nonexistent(self, tmp_path, monkeypatch):
+        _disable_keyring(monkeypatch)
         monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
         clear_credentials("https://nope.example.com")  # should not raise
 
-    def test_is_expired_true(self):
+
+class TestTokenStoreKeyring:
+    """Tests for credential persistence via system keychain."""
+
+    def _mock_keyring(self, monkeypatch):
+        """Set up an in-memory keyring mock and enable it."""
+        store = {}
+
+        def get_password(service, key):
+            return store.get((service, key))
+
+        def set_password(service, key, value):
+            store[(service, key)] = value
+
+        def delete_password(service, key):
+            store.pop((service, key), None)
+
+        mock_keyring = MagicMock()
+        mock_keyring.get_password = get_password
+        mock_keyring.set_password = set_password
+        mock_keyring.delete_password = delete_password
+
+        monkeypatch.setattr("murl.token_store._keyring_available", lambda: True)
+        import murl.token_store as ts
+        monkeypatch.setattr(ts, "_keyring_get", lambda key: _mock_keyring_get(store, key))
+        monkeypatch.setattr(ts, "_keyring_set", lambda key, creds: _mock_keyring_set(store, key, creds))
+        monkeypatch.setattr(ts, "_keyring_delete", lambda key: _mock_keyring_delete(store, key))
+        return store
+
+    def test_roundtrip(self, tmp_path, monkeypatch):
+        self._mock_keyring(monkeypatch)
+        monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
+        url = "https://example.com/mcp"
+        creds = {"access_token": "tok_keyring", "expires_at": time.time() + 3600}
+
+        assert get_credentials(url) is None
+        save_credentials(url, creds)
+        loaded = get_credentials(url)
+        assert loaded["access_token"] == "tok_keyring"
+        assert loaded["server_url"] == url
+        # No file should exist — creds are in the keychain.
+        assert len(list(tmp_path.glob("*.json"))) == 0
+
+    def test_clear(self, tmp_path, monkeypatch):
+        self._mock_keyring(monkeypatch)
+        monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
+        url = "https://example.com/mcp"
+        save_credentials(url, {"access_token": "tok"})
+        clear_credentials(url)
+        assert get_credentials(url) is None
+
+    def test_migration_from_file(self, tmp_path, monkeypatch):
+        """Credentials saved to file are readable once keyring is enabled."""
+        # First, save to filesystem.
+        _disable_keyring(monkeypatch)
+        monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
+        url = "https://example.com/mcp"
+        save_credentials(url, {"access_token": "old_file_tok"})
+        assert len(list(tmp_path.glob("*.json"))) == 1
+
+        # Now enable keyring — get should find the file credential.
+        self._mock_keyring(monkeypatch)
+        loaded = get_credentials(url)
+        assert loaded["access_token"] == "old_file_tok"
+
+        # Re-saving moves it to keychain and cleans up the file.
+        save_credentials(url, {"access_token": "new_keyring_tok"})
+        loaded = get_credentials(url)
+        assert loaded["access_token"] == "new_keyring_tok"
+        assert len(list(tmp_path.glob("*.json"))) == 0
+
+    def test_keyring_failure_falls_back_to_file(self, tmp_path, monkeypatch):
+        """If keyring save fails, credentials go to a file instead."""
+        monkeypatch.setattr("murl.token_store._keyring_available", lambda: True)
+        import murl.token_store as ts
+        monkeypatch.setattr(ts, "_keyring_set", lambda key, creds: False)
+        monkeypatch.setattr(ts, "_keyring_get", lambda key: None)
+        monkeypatch.setattr(ts, "_keyring_delete", lambda key: None)
+        monkeypatch.setattr("murl.token_store.CREDENTIALS_DIR", tmp_path)
+
+        url = "https://example.com/mcp"
+        save_credentials(url, {"access_token": "fallback_tok"})
+        # Should have fallen back to file.
+        assert len(list(tmp_path.glob("*.json"))) == 1
+
+
+class TestIsExpired:
+    """Tests for token expiry checks."""
+
+    def test_expired(self):
         assert is_expired({"expires_at": time.time() - 10})
 
-    def test_is_expired_false(self):
+    def test_not_expired(self):
         assert not is_expired({"expires_at": time.time() + 3600})
 
-    def test_is_expired_within_buffer(self):
+    def test_within_buffer(self):
         # Expires in 30s — within the 60s buffer
         assert is_expired({"expires_at": time.time() + 30})
 
-    def test_is_expired_missing(self):
+    def test_missing(self):
         assert is_expired({})
 
 

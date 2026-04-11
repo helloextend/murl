@@ -1,4 +1,13 @@
-"""Credential storage for OAuth tokens."""
+"""Credential storage for OAuth tokens.
+
+Supports two backends (like gh CLI):
+  1. System keychain (macOS Keychain, GNOME Keyring / KDE Wallet, Windows
+     Credential Locker) via the ``keyring`` library.
+  2. Plain JSON files in ~/.murl/credentials/ as a fallback when keyring
+     is not installed or no secure backend is available.
+
+Install keychain support with: pip install mcp-curl[keychain]
+"""
 
 import hashlib
 import json
@@ -10,16 +19,68 @@ from typing import Optional
 
 CREDENTIALS_DIR = Path.home() / ".murl" / "credentials"
 EXPIRY_BUFFER_SECONDS = 60
+_KEYRING_SERVICE = "murl"
 
 
 def _key_for_url(server_url: str) -> str:
-    """Return a SHA-256 hash of the server URL for use as a filename."""
+    """Return a SHA-256 hash of the server URL for use as a storage key."""
     return hashlib.sha256(server_url.encode()).hexdigest()
 
 
-def get_credentials(server_url: str) -> Optional[dict]:
-    """Load stored credentials for a server URL, or None if not found."""
-    path = CREDENTIALS_DIR / f"{_key_for_url(server_url)}.json"
+def _keyring_available() -> bool:
+    """Check if keyring is installed and has a usable secure backend."""
+    try:
+        import keyring
+        import keyring.errors
+
+        backend = keyring.get_keyring()
+        backend_mod = type(backend).__module__.lower()
+        # The fail and null backends mean no real keychain is available.
+        if "fail" in backend_mod or "null" in backend_mod:
+            return False
+        return True
+    except Exception:
+        return False
+
+
+def _keyring_get(key: str) -> Optional[dict]:
+    """Read credentials from the system keychain."""
+    try:
+        import keyring
+
+        data = keyring.get_password(_KEYRING_SERVICE, key)
+        if data is None:
+            return None
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def _keyring_set(key: str, creds: dict) -> bool:
+    """Write credentials to the system keychain. Returns True on success."""
+    try:
+        import keyring
+
+        keyring.set_password(_KEYRING_SERVICE, key, json.dumps(creds))
+        return True
+    except Exception:
+        return False
+
+
+def _keyring_delete(key: str) -> None:
+    """Delete credentials from the system keychain."""
+    try:
+        import keyring
+        import keyring.errors
+
+        keyring.delete_password(_KEYRING_SERVICE, key)
+    except Exception:
+        pass  # Not found or backend error — either way, nothing to clear.
+
+
+def _file_get(key: str) -> Optional[dict]:
+    """Read credentials from a JSON file."""
+    path = CREDENTIALS_DIR / f"{key}.json"
     if not path.exists():
         return None
     try:
@@ -29,29 +90,70 @@ def get_credentials(server_url: str) -> Optional[dict]:
         return None
 
 
-def save_credentials(server_url: str, creds: dict) -> None:
-    """Persist credentials for a server URL."""
+def _file_set(key: str, creds: dict) -> None:
+    """Write credentials to a JSON file with restrictive permissions."""
     CREDENTIALS_DIR.mkdir(parents=True, exist_ok=True)
     try:
         os.chmod(CREDENTIALS_DIR, 0o700)
     except OSError:
-        pass  # Best-effort directory permissions
-    path = CREDENTIALS_DIR / f"{_key_for_url(server_url)}.json"
-    data_to_save = dict(creds)
-    data_to_save["server_url"] = server_url
+        pass
+    path = CREDENTIALS_DIR / f"{key}.json"
     with open(path, "w") as f:
-        json.dump(data_to_save, f, indent=2)
+        json.dump(creds, f, indent=2)
     try:
         os.chmod(path, 0o600)
     except OSError:
-        pass  # Best-effort permissions
+        pass
+
+
+def _file_delete(key: str) -> None:
+    """Delete a credential file."""
+    path = CREDENTIALS_DIR / f"{key}.json"
+    if path.exists():
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def get_credentials(server_url: str) -> Optional[dict]:
+    """Load stored credentials for a server URL, or None if not found.
+
+    Tries the system keychain first, then falls back to the filesystem.
+    """
+    key = _key_for_url(server_url)
+    if _keyring_available():
+        creds = _keyring_get(key)
+        if creds is not None:
+            return creds
+    # Fallback (or migration path): check filesystem.
+    return _file_get(key)
+
+
+def save_credentials(server_url: str, creds: dict) -> None:
+    """Persist credentials for a server URL.
+
+    Saves to the system keychain if available, otherwise to a file.
+    When saving to keychain, removes any stale credential file.
+    """
+    key = _key_for_url(server_url)
+    data_to_save = dict(creds)
+    data_to_save["server_url"] = server_url
+
+    if _keyring_available() and _keyring_set(key, data_to_save):
+        # Clean up any legacy file now that creds live in the keychain.
+        _file_delete(key)
+        return
+    # Fallback: write to filesystem.
+    _file_set(key, data_to_save)
 
 
 def clear_credentials(server_url: str) -> None:
-    """Delete stored credentials for a server URL."""
-    path = CREDENTIALS_DIR / f"{_key_for_url(server_url)}.json"
-    if path.exists():
-        path.unlink()
+    """Delete stored credentials for a server URL from all backends."""
+    key = _key_for_url(server_url)
+    _keyring_delete(key)
+    _file_delete(key)
 
 
 def is_expired(creds: dict) -> bool:
