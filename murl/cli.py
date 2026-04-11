@@ -120,7 +120,7 @@ def _read_json_source(source: str) -> dict:
             with open(path) as f:
                 content = f.read()
     except OSError as e:
-        raise ValueError(f"Cannot read {source}: {e}")
+        raise ValueError(f"Cannot read {source}: {e}") from e
 
     if not content.strip():
         raise ValueError(f"Empty input from {source}")
@@ -128,7 +128,7 @@ def _read_json_source(source: str) -> dict:
     try:
         parsed = json.loads(content)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON from {source}: {e}")
+        raise ValueError(f"Invalid JSON from {source}: {e}") from e
 
     if not isinstance(parsed, dict):
         raise ValueError(
@@ -392,7 +392,7 @@ AUTHENTICATION:
   Credentials: ~/.murl/credentials/<hash>.json
 
 OPTIONS:
-  -d, --data <key=value|JSON|@file|@->  Request data (repeatable)
+  -d, --data <val>             Request data: key=value, JSON, @file, @- (repeatable)
   -H, --header <Key: Value>    HTTP header (repeatable)
   -v, --verbose                Pretty-print output, show request debug info
   --format <json|toon>          Output format (default: json, toon for LLMs)
