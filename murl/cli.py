@@ -273,14 +273,19 @@ async def make_mcp_request(
 
                 # List operations use cursor-based pagination (MCP 2025-11-25).
                 # We collect all pages so the caller gets the complete result set.
+                # Guard against buggy servers that repeat or cycle cursors.
+                MAX_PAGES = 1000
+
                 if method == 'tools/list':
                     all_items = []
                     cursor = None
-                    while True:
+                    seen_cursors: set = set()
+                    for _ in range(MAX_PAGES):
                         result = await session.list_tools(cursor=cursor)
                         all_items.extend(result.tools)
-                        if not result.nextCursor:
+                        if not result.nextCursor or result.nextCursor in seen_cursors:
                             break
+                        seen_cursors.add(result.nextCursor)
                         cursor = result.nextCursor
                     return [t.model_dump(mode='json', exclude_none=True) for t in all_items]
                 elif method == 'tools/call':
@@ -291,11 +296,13 @@ async def make_mcp_request(
                 elif method == 'resources/list':
                     all_items = []
                     cursor = None
-                    while True:
+                    seen_cursors = set()
+                    for _ in range(MAX_PAGES):
                         result = await session.list_resources(cursor=cursor)
                         all_items.extend(result.resources)
-                        if not result.nextCursor:
+                        if not result.nextCursor or result.nextCursor in seen_cursors:
                             break
+                        seen_cursors.add(result.nextCursor)
                         cursor = result.nextCursor
                     return [r.model_dump(mode='json', exclude_none=True) for r in all_items]
                 elif method == 'resources/read':
@@ -305,11 +312,13 @@ async def make_mcp_request(
                 elif method == 'prompts/list':
                     all_items = []
                     cursor = None
-                    while True:
+                    seen_cursors = set()
+                    for _ in range(MAX_PAGES):
                         result = await session.list_prompts(cursor=cursor)
                         all_items.extend(result.prompts)
-                        if not result.nextCursor:
+                        if not result.nextCursor or result.nextCursor in seen_cursors:
                             break
+                        seen_cursors.add(result.nextCursor)
                         cursor = result.nextCursor
                     return [p.model_dump(mode='json', exclude_none=True) for p in all_items]
                 elif method == 'prompts/get':
@@ -588,19 +597,18 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
-            # MCP 2025-11-25 §Scope Challenge Handling: on 403 insufficient_scope,
-            # parse required scopes from WWW-Authenticate and re-authorize.
+            # MCP 2025-11-25 §Scope Challenge Handling: on 403 with explicit
+            # insufficient_scope error, parse required scopes and re-authorize.
             elif not no_auth and is_403:
+                www_params = parse_www_authenticate(www_auth_header) if www_auth_header else {}
+                if www_params.get("error") != "insufficient_scope" or not www_params.get("scope"):
+                    raise
                 if verbose:
-                    click.echo("Received 403 — insufficient scope, re-authorizing...", err=True)
-                    if www_auth_header:
-                        click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
-                # Parse scope from WWW-Authenticate
-                scope_to_request = None
-                if www_auth_header:
-                    www_params = parse_www_authenticate(www_auth_header)
-                    scope_to_request = www_params.get("scope")
-                creds = authorize(base_url, www_authenticate=www_auth_header, scope=scope_to_request, **auth_kwargs)
+                    click.echo("Received 403 insufficient_scope — re-authorizing...", err=True)
+                    click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
+                # Merge scope override into auth_kwargs to avoid passing scope twice.
+                reauth_kwargs = {**auth_kwargs, "scope": www_params["scope"]}
+                creds = authorize(base_url, www_authenticate=www_auth_header, **reauth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))

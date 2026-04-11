@@ -332,7 +332,10 @@ def _run_callback_server(port: int, state: str, timeout: float) -> str:
     _CallbackHandler.auth_error = None
     _CallbackHandler.expected_state = state
 
-    server = HTTPServer(("127.0.0.1", port), _CallbackHandler)
+    # Bind to "localhost" (not "127.0.0.1") so the listener matches the
+    # redirect_uri host.  On machines where localhost resolves to ::1 first,
+    # binding 127.0.0.1 would miss IPv6 callbacks from the browser.
+    server = HTTPServer(("localhost", port), _CallbackHandler)
     server.timeout = timeout
 
     # Handle a single request (the callback)
@@ -424,11 +427,17 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
     if not scope and www_auth_params.get("scope"):
         scope = www_auth_params["scope"]
 
-    auth_server_meta = None
+    # Two-phase discovery: first try RFC 9728 resource metadata, then fetch
+    # auth server metadata from the advertised issuer.  Only fall back to
+    # legacy discovery when resource metadata itself is unavailable — if the
+    # issuer is found but its metadata fetch fails, that error must propagate.
     try:
-        # RFC 9728: fetch Protected Resource Metadata
         resource_meta = discover_resource_metadata(server_url, resource_metadata_url)
-
+    except OAuthError:
+        # Resource metadata unavailable — fall back to legacy direct discovery
+        # for servers not yet on MCP 2025-11-25.
+        auth_server_meta = discover_metadata(server_url)
+    else:
         # Extract scope from resource metadata if not already set
         if not scope and resource_meta.get("scopes_supported"):
             scope = " ".join(resource_meta["scopes_supported"])
@@ -440,11 +449,9 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
         issuer_url = auth_servers[0]
 
-        # Fetch auth server metadata (RFC 8414 + OIDC fallback)
+        # Fetch auth server metadata (RFC 8414 + OIDC fallback).
+        # Errors here propagate — the issuer was explicitly advertised.
         auth_server_meta = discover_auth_server_metadata(issuer_url)
-    except OAuthError:
-        # Fallback: legacy direct discovery (for servers not yet on 2025-11-25)
-        auth_server_meta = discover_metadata(server_url)
 
     meta = auth_server_meta
     auth_endpoint = meta["authorization_endpoint"]
