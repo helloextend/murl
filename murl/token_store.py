@@ -98,19 +98,19 @@ def _file_set(key: str, creds: dict) -> None:
     except OSError:
         pass
     path = CREDENTIALS_DIR / f"{key}.json"
-    with open(path, "w") as f:
+    # Create file with 0600 from the start to avoid a brief window where
+    # tokens are world-readable under a permissive umask.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         json.dump(creds, f, indent=2)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
 
 
 def _file_delete(key: str) -> None:
-    """Delete a credential file."""
-    path = CREDENTIALS_DIR / f"{key}.json"
-    if path.exists():
-        path.unlink()
+    """Delete a credential file (best-effort)."""
+    try:
+        (CREDENTIALS_DIR / f"{key}.json").unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------------------
