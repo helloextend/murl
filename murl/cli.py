@@ -106,6 +106,9 @@ def parse_data_value(value: str) -> Any:
     return value
 
 
+_MAX_FILE_READ_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
 def _read_json_source(source: str) -> dict:
     """Read a JSON object from stdin (@-) or a file (@path).
 
@@ -115,12 +118,17 @@ def _read_json_source(source: str) -> dict:
     path = source[1:]  # strip leading @
     try:
         if path == '-':
-            content = sys.stdin.read()
+            content = sys.stdin.read(_MAX_FILE_READ_BYTES + 1)
         else:
             with open(path) as f:
-                content = f.read()
+                content = f.read(_MAX_FILE_READ_BYTES + 1)
     except OSError as e:
         raise ValueError(f"Cannot read {source}: {e}") from e
+
+    if len(content) > _MAX_FILE_READ_BYTES:
+        raise ValueError(
+            f"Input from {source} exceeds 10 MB limit"
+        )
 
     if not content.strip():
         raise ValueError(f"Empty input from {source}")
@@ -146,11 +154,24 @@ def parse_data_flags(data_flags: Tuple[str, ...]) -> Dict[str, Any]:
         - @-              — read JSON object from stdin (curl convention)
         - @path           — read JSON object from a file
     """
+    # Detect multiple @- (stdin) references before reading anything.
+    # Stdin is a one-shot resource; the second read would always be empty.
+    stdin_count = sum(1 for d in data_flags if d.strip() == '@-')
+    if stdin_count > 1:
+        raise ValueError(
+            "stdin (@-) can only be used once (it is consumed on first read)"
+        )
+
     result = {}
 
     for data in data_flags:
         stripped = data.strip()
-        if stripped.startswith('@'):
+        # Check for key=value first so that e.g. "email=@user" is not
+        # mistaken for a @-source read.
+        if '=' in stripped and not stripped.startswith('{') and not stripped.startswith('['):
+            key, value = data.split('=', 1)
+            result[key] = parse_data_value(value)
+        elif stripped.startswith('@'):
             result.update(_read_json_source(stripped))
         elif stripped.startswith('{'):
             try:
@@ -163,11 +184,7 @@ def parse_data_flags(data_flags: Tuple[str, ...]) -> Dict[str, Any]:
         elif stripped.startswith('['):
             raise ValueError(f"JSON arrays are not supported in -d flag. Use key=value or JSON objects.")
         else:
-            if '=' not in data:
-                raise ValueError(f"Invalid data format: {data}. Expected key=value or JSON")
-
-            key, value = data.split('=', 1)
-            result[key] = parse_data_value(value)
+            raise ValueError(f"Invalid data format: {data}. Expected key=value or JSON")
 
     return result
 
