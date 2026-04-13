@@ -271,14 +271,15 @@ def register_client(registration_endpoint: str, redirect_uri: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class _CallbackHandler(BaseHTTPRequestHandler):
-    """Tiny HTTP handler that captures the OAuth callback."""
+    """Tiny HTTP handler that captures the OAuth callback.
 
-    # Shared across instances via class attrs set before serve_forever()
-    auth_code: Optional[str] = None
-    auth_error: Optional[str] = None
-    expected_state: Optional[str] = None
+    Per-request state is stored on ``self.server.callback_state`` (a dict set
+    by ``_run_callback_server``) instead of class attributes, so concurrent
+    ``authorize()`` calls don't race-write to shared slots.
+    """
 
     def do_GET(self):  # noqa: N802
+        ctx = self.server.callback_state
         parsed = urllib.parse.urlparse(self.path)
         params = urllib.parse.parse_qs(parsed.query)
 
@@ -289,25 +290,25 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
         # Validate state
         state = params.get("state", [None])[0]
-        if state != self.expected_state:
-            _CallbackHandler.auth_error = "State mismatch"
+        if state != ctx["expected_state"]:
+            ctx["auth_error"] = "State mismatch"
             self._respond("Authorization failed: state mismatch.")
             return
 
         error = params.get("error", [None])[0]
         if error:
             desc = params.get("error_description", [error])[0]
-            _CallbackHandler.auth_error = desc
+            ctx["auth_error"] = desc
             self._respond(f"Authorization failed: {desc}")
             return
 
         code = params.get("code", [None])[0]
         if not code:
-            _CallbackHandler.auth_error = "No authorization code received"
+            ctx["auth_error"] = "No authorization code received"
             self._respond("Authorization failed: no code received.")
             return
 
-        _CallbackHandler.auth_code = code
+        ctx["auth_code"] = code
         self._respond("Authorization successful! You can close this tab.")
 
     def _respond(self, body: str):
@@ -328,25 +329,29 @@ class _CallbackHandler(BaseHTTPRequestHandler):
 
 def _run_callback_server(port: int, state: str, timeout: float) -> str:
     """Start a local server, wait for the callback, return the auth code."""
-    _CallbackHandler.auth_code = None
-    _CallbackHandler.auth_error = None
-    _CallbackHandler.expected_state = state
-
     # Bind to "localhost" (not "127.0.0.1") so the listener matches the
     # redirect_uri host.  On machines where localhost resolves to ::1 first,
     # binding 127.0.0.1 would miss IPv6 callbacks from the browser.
     server = HTTPServer(("localhost", port), _CallbackHandler)
     server.timeout = timeout
+    # Per-instance state dict avoids class-level attributes that would be
+    # shared (and race-written) across concurrent authorize() calls.
+    server.callback_state = {
+        "auth_code": None,
+        "auth_error": None,
+        "expected_state": state,
+    }
 
     # Handle a single request (the callback)
     server.handle_request()
     server.server_close()
 
-    if _CallbackHandler.auth_error:
-        raise OAuthError(_CallbackHandler.auth_error)
-    if not _CallbackHandler.auth_code:
+    ctx = server.callback_state
+    if ctx["auth_error"]:
+        raise OAuthError(ctx["auth_error"])
+    if not ctx["auth_code"]:
         raise OAuthError("Timed out waiting for authorization callback")
-    return _CallbackHandler.auth_code
+    return ctx["auth_code"]
 
 
 # ---------------------------------------------------------------------------
@@ -380,6 +385,35 @@ def _canonical_resource_uri(server_url: str) -> str:
     return urllib.parse.urlunparse((
         parsed.scheme, parsed.netloc, parsed.path, "", "", ""
     ))
+
+
+def _validate_auth_server_origin(auth_server_url: str, server_url: str) -> None:
+    """Validate that the authorization server shares the same origin as the MCP server.
+
+    RFC 9728 §3 requires that clients verify the authorization server's hostname
+    matches the resource server.  Without this check, a malicious MCP endpoint
+    could redirect the OAuth flow to an attacker-controlled authorization server
+    via a crafted ``authorization_servers`` value.
+
+    Raises OAuthError if the hostnames don't match.
+    """
+    resource_parsed = urllib.parse.urlparse(server_url)
+    auth_parsed = urllib.parse.urlparse(auth_server_url)
+
+    if not auth_parsed.hostname:
+        raise OAuthError(
+            f"Invalid authorization server URL: {auth_server_url}"
+        )
+
+    # Compare hostnames (case-insensitive per RFC 4343).
+    if resource_parsed.hostname.lower() != auth_parsed.hostname.lower():
+        raise OAuthError(
+            f"Authorization server hostname '{auth_parsed.hostname}' does not match "
+            f"MCP server hostname '{resource_parsed.hostname}'. "
+            f"This could indicate a malicious server redirect. "
+            f"If this is expected, use --client-id to supply pre-registered credentials "
+            f"and bypass discovery."
+        )
 
 
 def authorize(server_url: str, www_authenticate: Optional[str] = None,
@@ -448,6 +482,10 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
             raise OAuthError("Protected Resource Metadata has empty authorization_servers")
 
         issuer_url = auth_servers[0]
+
+        # RFC 9728 §3: validate that the authorization server's hostname
+        # matches the MCP server to prevent redirect attacks.
+        _validate_auth_server_origin(issuer_url, server_url)
 
         # Fetch auth server metadata (RFC 8414 + OIDC fallback).
         # Errors here propagate — the issuer was explicitly advertised.

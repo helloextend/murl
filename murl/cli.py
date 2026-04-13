@@ -276,51 +276,35 @@ async def make_mcp_request(
                 # Guard against buggy servers that repeat or cycle cursors.
                 MAX_PAGES = 1000
 
-                if method == 'tools/list':
+                async def _collect_all(fetch_page, extract_items):
+                    """Paginate a list endpoint, returning all items across pages."""
                     all_items = []
                     cursor = None
                     seen_cursors: set = set()
                     for _ in range(MAX_PAGES):
-                        result = await session.list_tools(cursor=cursor)
-                        all_items.extend(result.tools)
+                        result = await fetch_page(cursor=cursor)
+                        all_items.extend(extract_items(result))
                         if not result.nextCursor or result.nextCursor in seen_cursors:
                             break
                         seen_cursors.add(result.nextCursor)
                         cursor = result.nextCursor
-                    return [t.model_dump(mode='json', exclude_none=True) for t in all_items]
+                    return [item.model_dump(mode='json', exclude_none=True) for item in all_items]
+
+                if method == 'tools/list':
+                    return await _collect_all(session.list_tools, lambda r: r.tools)
                 elif method == 'tools/call':
                     tool_name = params.get('name')
                     arguments = params.get('arguments', {})
                     result = await session.call_tool(tool_name, arguments)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.content]
                 elif method == 'resources/list':
-                    all_items = []
-                    cursor = None
-                    seen_cursors = set()
-                    for _ in range(MAX_PAGES):
-                        result = await session.list_resources(cursor=cursor)
-                        all_items.extend(result.resources)
-                        if not result.nextCursor or result.nextCursor in seen_cursors:
-                            break
-                        seen_cursors.add(result.nextCursor)
-                        cursor = result.nextCursor
-                    return [r.model_dump(mode='json', exclude_none=True) for r in all_items]
+                    return await _collect_all(session.list_resources, lambda r: r.resources)
                 elif method == 'resources/read':
                     uri = params.get('uri')
                     result = await session.read_resource(uri)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.contents]
                 elif method == 'prompts/list':
-                    all_items = []
-                    cursor = None
-                    seen_cursors = set()
-                    for _ in range(MAX_PAGES):
-                        result = await session.list_prompts(cursor=cursor)
-                        all_items.extend(result.prompts)
-                        if not result.nextCursor or result.nextCursor in seen_cursors:
-                            break
-                        seen_cursors.add(result.nextCursor)
-                        cursor = result.nextCursor
-                    return [p.model_dump(mode='json', exclude_none=True) for p in all_items]
+                    return await _collect_all(session.list_prompts, lambda r: r.prompts)
                 elif method == 'prompts/get':
                     prompt_name = params.get('name')
                     arguments = params.get('arguments', {})
@@ -423,7 +407,7 @@ OPTIONS:
   --login                      Force OAuth re-authentication
   --no-auth                    Skip all authentication
   --client-id <id>             Pre-registered OAuth client ID (skip DCR)
-  --client-secret <secret>     Pre-registered OAuth client secret
+  --client-secret <secret>     Pre-registered OAuth client secret (or MURL_CLIENT_SECRET env)
   --callback-port <port>       Fixed port for OAuth callback redirect URI
   --scope <scopes>             OAuth scope to request (e.g. "openid profile")
   --version                    Version info
@@ -486,7 +470,8 @@ def _probe_www_authenticate(base_url: str) -> Optional[str]:
 @click.option('--login', is_flag=True, help='Force OAuth re-authentication')
 @click.option('--no-auth', is_flag=True, help='Skip all authentication')
 @click.option('--client-id', default=None, help='Pre-registered OAuth client ID (skips dynamic registration)')
-@click.option('--client-secret', default=None, help='Pre-registered OAuth client secret')
+@click.option('--client-secret', default=None, envvar='MURL_CLIENT_SECRET',
+              help='Pre-registered OAuth client secret (or set MURL_CLIENT_SECRET)')
 @click.option('--callback-port', default=None, type=int,
               help='Fixed port for OAuth callback (must match registered redirect URI)')
 @click.option('--scope', default=None,

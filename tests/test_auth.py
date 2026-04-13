@@ -11,6 +11,7 @@ from murl.auth import (
     _auth_base_url,
     _canonical_resource_uri,
     _generate_pkce,
+    _validate_auth_server_origin,
     discover_metadata,
     discover_resource_metadata,
     discover_auth_server_metadata,
@@ -482,6 +483,46 @@ class TestDiscoverAuthServerMetadata:
 
 
 # ---------------------------------------------------------------------------
+# _validate_auth_server_origin (RFC 9728 §3)
+# ---------------------------------------------------------------------------
+
+class TestValidateAuthServerOrigin:
+    """Prevent redirect attacks via crafted authorization_servers values."""
+
+    def test_same_host_passes(self):
+        _validate_auth_server_origin(
+            "https://example.com/oauth2", "https://example.com/mcp"
+        )
+
+    def test_same_host_different_port_passes(self):
+        """Port differs but hostname matches — allowed."""
+        _validate_auth_server_origin(
+            "https://example.com:8443/oauth", "https://example.com/mcp"
+        )
+
+    def test_case_insensitive(self):
+        _validate_auth_server_origin(
+            "https://Example.COM/oauth", "https://example.com/mcp"
+        )
+
+    def test_different_host_raises(self):
+        with pytest.raises(OAuthError, match="does not match"):
+            _validate_auth_server_origin(
+                "https://evil.example.com/oauth", "https://mcp.example.com/mcp"
+            )
+
+    def test_attacker_redirect_raises(self):
+        with pytest.raises(OAuthError, match="does not match"):
+            _validate_auth_server_origin(
+                "https://attacker.com", "https://legit-server.com/mcp"
+            )
+
+    def test_invalid_url_raises(self):
+        with pytest.raises(OAuthError, match="Invalid authorization server"):
+            _validate_auth_server_origin("not-a-url", "https://example.com/mcp")
+
+
+# ---------------------------------------------------------------------------
 # canonical_resource_uri
 # ---------------------------------------------------------------------------
 
@@ -640,21 +681,21 @@ class TestAuthorize:
         Metadata field).  Major IDPs like Okta fully support S256 PKCE but don't
         include the field in their OIDC discovery document.
         """
-        # Resource metadata -> points to auth server
+        # Resource metadata -> points to auth server (same origin as MCP server)
         resource_meta_resp = MagicMock()
         resource_meta_resp.status_code = 200
         resource_meta_resp.json.return_value = {
-            "authorization_servers": ["https://auth.example.com/oauth2/default"],
+            "authorization_servers": ["https://example.com/oauth2/default"],
         }
 
         # Auth server metadata via OIDC (no code_challenge_methods_supported)
         oidc_resp = MagicMock()
         oidc_resp.status_code = 200
         oidc_resp.json.return_value = {
-            "issuer": "https://auth.example.com/oauth2/default",
-            "authorization_endpoint": "https://auth.example.com/oauth2/default/v1/authorize",
-            "token_endpoint": "https://auth.example.com/oauth2/default/v1/token",
-            "registration_endpoint": "https://auth.example.com/oauth2/v1/clients",
+            "issuer": "https://example.com/oauth2/default",
+            "authorization_endpoint": "https://example.com/oauth2/default/v1/authorize",
+            "token_endpoint": "https://example.com/oauth2/default/v1/token",
+            "registration_endpoint": "https://example.com/oauth2/v1/clients",
             # No code_challenge_methods_supported — typical for Okta OIDC
         }
 
@@ -772,3 +813,19 @@ class TestAuthorize:
 
         with pytest.raises(OAuthError, match="--client-id"):
             authorize("https://example.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_cross_origin_auth_server_rejected(self, mock_get, mock_post, mock_browser, mock_server):
+        """RFC 9728 §3: reject authorization_servers with a different hostname."""
+        resource_meta_resp = MagicMock()
+        resource_meta_resp.status_code = 200
+        resource_meta_resp.json.return_value = {
+            "authorization_servers": ["https://evil.attacker.com/oauth"],
+        }
+        mock_get.return_value = resource_meta_resp
+
+        with pytest.raises(OAuthError, match="does not match"):
+            authorize("https://legit-server.com/mcp")
