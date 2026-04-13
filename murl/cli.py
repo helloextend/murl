@@ -106,19 +106,74 @@ def parse_data_value(value: str) -> Any:
     return value
 
 
+_MAX_FILE_READ_BYTES = 10 * 1024 * 1024  # 10 MB
+
+
+def _read_json_source(source: str) -> dict:
+    """Read a JSON object from stdin (@-) or a file (@path).
+
+    Follows the curl convention: -d @- reads stdin, -d @file reads a file.
+    The content must be a JSON object (dict), not an array or scalar.
+    """
+    path = source[1:]  # strip leading @
+    try:
+        if path == '-':
+            content = sys.stdin.read(_MAX_FILE_READ_BYTES + 1)
+        else:
+            with open(path) as f:
+                content = f.read(_MAX_FILE_READ_BYTES + 1)
+    except OSError as e:
+        raise ValueError(f"Cannot read {source}: {e}") from e
+
+    if len(content) > _MAX_FILE_READ_BYTES:
+        raise ValueError(
+            f"Input from {source} exceeds 10 MB limit"
+        )
+
+    if not content.strip():
+        raise ValueError(f"Empty input from {source}")
+
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON from {source}: {e}") from e
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"JSON from {source} must be an object, not {type(parsed).__name__}"
+        )
+    return parsed
+
+
 def parse_data_flags(data_flags: Tuple[str, ...]) -> Dict[str, Any]:
     """Parse -d/--data flags into a dictionary.
 
-    Note:
-        JSON objects (starting with '{') are merged into the result.
-        JSON arrays (starting with '[') are not supported as they don't
-        represent key-value pairs needed for MCP arguments.
+    Supports three formats (processed in order, later values override earlier):
+        - key=value       — simple key-value pair with type coercion
+        - {"key": "val"}  — inline JSON object, merged into result
+        - @-              — read JSON object from stdin (curl convention)
+        - @path           — read JSON object from a file
     """
+    # Detect multiple @- (stdin) references before reading anything.
+    # Stdin is a one-shot resource; the second read would always be empty.
+    stdin_count = sum(1 for d in data_flags if d.strip() == '@-')
+    if stdin_count > 1:
+        raise ValueError(
+            "stdin (@-) can only be used once (it is consumed on first read)"
+        )
+
     result = {}
 
     for data in data_flags:
         stripped = data.strip()
-        if stripped.startswith('{'):
+        # Check for key=value first so that e.g. "email=@user" is not
+        # mistaken for a @-source read.
+        if '=' in stripped and not stripped.startswith('{') and not stripped.startswith('['):
+            key, value = data.split('=', 1)
+            result[key] = parse_data_value(value)
+        elif stripped.startswith('@'):
+            result.update(_read_json_source(stripped))
+        elif stripped.startswith('{'):
             try:
                 parsed = json.loads(data)
                 if not isinstance(parsed, dict):
@@ -129,11 +184,7 @@ def parse_data_flags(data_flags: Tuple[str, ...]) -> Dict[str, Any]:
         elif stripped.startswith('['):
             raise ValueError(f"JSON arrays are not supported in -d flag. Use key=value or JSON objects.")
         else:
-            if '=' not in data:
-                raise ValueError(f"Invalid data format: {data}. Expected key=value or JSON")
-
-            key, value = data.split('=', 1)
-            result[key] = parse_data_value(value)
+            raise ValueError(f"Invalid data format: {data}. Expected key=value or JSON")
 
     return result
 
@@ -338,8 +389,13 @@ DESCRIPTION:
 EXAMPLES:
   murl https://server.com/mcp/tools                         # List tools
   murl https://server.com/mcp/tools/echo -d message=hello   # Call tool
+  murl https://server.com/mcp/tools/echo -d @params.json    # Args from file
+  echo '{"message":"hi"}' | murl $S/tools/echo -d @-        # Args from stdin
   murl https://server.com/mcp/resources/path/to/file         # Read resource
   murl https://server.com/mcp/prompts/greeting -d name=Alice # Get prompt
+
+PIPELINES:
+  murl $S/tools/search -d q=foo | jq '{id:.[0].text}' | murl $S/tools/get -d @-
 
 AUTHENTICATION:
   OAuth 2.0 (RFC 7591) with PKCE is built in.
@@ -353,7 +409,7 @@ AUTHENTICATION:
   Credentials: ~/.murl/credentials/<hash>.json
 
 OPTIONS:
-  -d, --data <key=value|JSON>  Request data (repeatable)
+  -d, --data <val>             Request data: key=value, JSON, @file, @- (repeatable)
   -H, --header <Key: Value>    HTTP header (repeatable)
   -v, --verbose                Pretty-print output, show request debug info
   --format <json|toon>          Output format (default: json, toon for LLMs)

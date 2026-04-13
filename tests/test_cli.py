@@ -168,6 +168,48 @@ def test_parse_data_flags_invalid_json():
         parse_data_flags(('{"invalid": json}',))
 
 
+def test_parse_data_flags_stdin(monkeypatch):
+    """@- reads a JSON object from stdin."""
+    monkeypatch.setattr('sys.stdin', __import__('io').StringIO('{"key": "from_stdin"}'))
+    result = parse_data_flags(('@-',))
+    assert result == {"key": "from_stdin"}
+
+
+def test_parse_data_flags_stdin_merged_with_flags(monkeypatch):
+    """Explicit -d key=value overrides stdin values (later flags win)."""
+    monkeypatch.setattr('sys.stdin', __import__('io').StringIO('{"a": 1, "b": 2}'))
+    result = parse_data_flags(('@-', 'b=99'))
+    assert result == {"a": 1, "b": 99}
+
+
+def test_parse_data_flags_file(tmp_path):
+    """@path reads a JSON object from a file."""
+    f = tmp_path / "args.json"
+    f.write_text('{"name": "from_file", "count": 3}')
+    result = parse_data_flags((f'@{f}',))
+    assert result == {"name": "from_file", "count": 3}
+
+
+def test_parse_data_flags_file_not_found():
+    """@nonexistent gives a clear error."""
+    with pytest.raises(ValueError, match="Cannot read @/no/such/file"):
+        parse_data_flags(('@/no/such/file',))
+
+
+def test_parse_data_flags_stdin_non_object(monkeypatch):
+    """@- with a JSON array (not object) raises ValueError."""
+    monkeypatch.setattr('sys.stdin', __import__('io').StringIO('[1, 2, 3]'))
+    with pytest.raises(ValueError, match="must be an object, not list"):
+        parse_data_flags(('@-',))
+
+
+def test_parse_data_flags_stdin_empty(monkeypatch):
+    """@- with empty stdin raises ValueError."""
+    monkeypatch.setattr('sys.stdin', __import__('io').StringIO(''))
+    with pytest.raises(ValueError, match="Empty input"):
+        parse_data_flags(('@-',))
+
+
 def test_map_tools_list():
     method, params = map_virtual_path_to_method("/tools", {})
     assert method == "tools/list"
