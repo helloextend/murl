@@ -11,10 +11,13 @@ Install keychain support with: pip install mcp-curl[keychain]
 
 import hashlib
 import json
+import logging
 import os
 import time
 from pathlib import Path
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 CREDENTIALS_DIR = Path.home() / ".murl" / "credentials"
@@ -44,16 +47,18 @@ def _keyring_available() -> bool:
 
 
 def _keyring_get(key: str) -> Optional[dict]:
-    """Read credentials from the system keychain."""
-    try:
-        import keyring
+    """Read credentials from the system keychain.
 
-        data = keyring.get_password(_KEYRING_SERVICE, key)
-        if data is None:
-            return None
-        return json.loads(data)
-    except Exception:
+    Returns the parsed credentials dict, None if the key is not found,
+    or raises on backend errors so the caller can decide how to handle
+    the failure.
+    """
+    import keyring
+
+    data = keyring.get_password(_KEYRING_SERVICE, key)
+    if data is None:
         return None
+    return json.loads(data)
 
 
 def _keyring_set(key: str, creds: dict) -> bool:
@@ -67,15 +72,19 @@ def _keyring_set(key: str, creds: dict) -> bool:
         return False
 
 
-def _keyring_delete(key: str) -> None:
-    """Delete credentials from the system keychain."""
+def _keyring_delete(key: str) -> bool:
+    """Delete credentials from the system keychain. Returns True on success."""
     try:
         import keyring
         import keyring.errors
 
         keyring.delete_password(_KEYRING_SERVICE, key)
+        return True
+    except keyring.errors.PasswordDeleteError:
+        # Entry did not exist — nothing to delete, considered success.
+        return True
     except Exception:
-        pass  # Not found or backend error — either way, nothing to clear.
+        return False
 
 
 def _file_get(key: str) -> Optional[dict]:
@@ -105,12 +114,13 @@ def _file_set(key: str, creds: dict) -> None:
         json.dump(creds, f, indent=2)
 
 
-def _file_delete(key: str) -> None:
-    """Delete a credential file (best-effort)."""
+def _file_delete(key: str) -> bool:
+    """Delete a credential file. Returns True on success."""
     try:
         (CREDENTIALS_DIR / f"{key}.json").unlink(missing_ok=True)
+        return True
     except OSError:
-        pass
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -124,9 +134,15 @@ def get_credentials(server_url: str) -> Optional[dict]:
     """
     key = _key_for_url(server_url)
     if _keyring_available():
-        creds = _keyring_get(key)
-        if creds is not None:
-            return creds
+        try:
+            creds = _keyring_get(key)
+            if creds is not None:
+                return creds
+        except Exception:
+            logger.warning(
+                "Failed to read credentials from system keychain; "
+                "falling back to file-based credential storage"
+            )
     # Fallback (or migration path): check filesystem.
     return _file_get(key)
 
@@ -149,11 +165,30 @@ def save_credentials(server_url: str, creds: dict) -> None:
     _file_set(key, data_to_save)
 
 
-def clear_credentials(server_url: str) -> None:
-    """Delete stored credentials for a server URL from all backends."""
+def clear_credentials(server_url: str) -> bool:
+    """Delete stored credentials for a server URL from all backends.
+
+    Returns True if all applicable deletions succeeded.  Returns False
+    (and logs a warning) if any backend failed to delete, but never
+    raises so the logout flow is not interrupted.
+    """
     key = _key_for_url(server_url)
-    _keyring_delete(key)
-    _file_delete(key)
+    success = True
+
+    if _keyring_available():
+        if not _keyring_delete(key):
+            logger.warning(
+                "Failed to delete credentials from system keychain"
+            )
+            success = False
+
+    if not _file_delete(key):
+        logger.warning(
+            "Failed to delete credentials from file storage"
+        )
+        success = False
+
+    return success
 
 
 def is_expired(creds: dict) -> bool:
