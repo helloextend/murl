@@ -703,7 +703,7 @@ class TestAuthorize:
         not_found = MagicMock()
         not_found.status_code = 405
 
-        # Order: resource_meta path-aware, resource_meta root, AS rfc8414, OIDC insert, OIDC append
+        # Order: resource_meta path-aware (succeeds), AS rfc8414, OIDC insert, OIDC append
         mock_get.side_effect = [resource_meta_resp, not_found, not_found, oidc_resp]
 
         # Registration + token exchange
