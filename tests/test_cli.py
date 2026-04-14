@@ -265,6 +265,21 @@ def test_map_resources_read_relative_path():
     assert params == {"uri": "file:///relative/path"}
 
 
+def test_map_resources_read_custom_uri_scheme():
+    """Path containing :// is treated as a full URI, not a file path."""
+    method, params = map_virtual_path_to_method("/resources/https://example.com/data", {})
+    assert method == "resources/read"
+    assert params == {"uri": "https://example.com/data"}
+
+
+def test_map_resources_read_uri_override():
+    """The -d uri=... flag overrides the path-derived URI."""
+    data = {"uri": "git://repo/file.txt"}
+    method, params = map_virtual_path_to_method("/resources/placeholder", data)
+    assert method == "resources/read"
+    assert params["uri"] == "git://repo/file.txt"
+
+
 def test_map_prompts_list():
     method, params = map_virtual_path_to_method("/prompts", {})
     assert method == "prompts/list"
@@ -700,6 +715,57 @@ def test_cli_401_retry_triggers_oauth(mcp_server):
     assert call_count[0] >= 2, "Should retry after 401"
 
 
+def test_cli_403_step_up_triggers_reauth(mcp_server):
+    """A 403 with insufficient_scope triggers re-authorization with required scopes."""
+    from unittest.mock import patch, MagicMock
+    import time as _time
+    import httpx
+
+    fake_creds = {
+        "client_id": "cid",
+        "access_token": "tok_stepup",
+        "refresh_token": "rt",
+        "expires_at": _time.time() + 3600,
+        "token_endpoint": "https://auth.example.com/token",
+        "registration_endpoint": "https://auth.example.com/register",
+        "server_url": "http://localhost",
+    }
+
+    call_count = [0]
+
+    async def mock_make_mcp_request(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] == 1:
+            # Simulate a 403 with WWW-Authenticate header
+            mock_response = MagicMock(spec=httpx.Response)
+            mock_response.status_code = 403
+            mock_response.headers = {
+                "www-authenticate": 'Bearer error="insufficient_scope", scope="files:write"'
+            }
+            mock_response.text = "Forbidden"
+            mock_response.stream = MagicMock()
+            raise httpx.HTTPStatusError(
+                "403 Forbidden",
+                request=MagicMock(spec=httpx.Request),
+                response=mock_response,
+            )
+        # Return a successful result on retry
+        return [{"name": "test_tool"}]
+
+    runner = CliRunner()
+    with patch("murl.cli.make_mcp_request", side_effect=mock_make_mcp_request), \
+         patch("murl.cli.authorize", return_value=fake_creds) as mock_auth, \
+         patch("murl.cli.save_credentials"):
+        result = runner.invoke(main, [f"{TEST_SERVER_URL}/tools"])
+
+    assert mock_auth.called, "authorize should be called after 403 insufficient_scope"
+    # Verify scope was passed to authorize
+    _, auth_kwargs = mock_auth.call_args
+    assert auth_kwargs.get("scope") == "files:write", "authorize should be called with the required scope"
+    assert call_count[0] >= 2, "Should retry after 403"
+    assert result.exit_code == 0
+
+
 def test_cli_no_auth_skips_all_auth(mcp_server):
     """--no-auth skips credential loading and OAuth entirely."""
     from unittest.mock import patch
@@ -819,3 +885,242 @@ def test_toon_empty_result(mcp_server):
 
     assert result.exit_code == 0
     assert '[0]:' in result.output
+
+
+def test_cli_unsupported_capability_error():
+    """CLI outputs structured INVALID_ARGUMENT error when server lacks the requested capability."""
+    from unittest.mock import patch, AsyncMock
+
+    runner = CliRunner()
+    with patch(
+        "murl.cli.make_mcp_request",
+        new_callable=AsyncMock,
+        side_effect=ValueError("Server does not support 'resources'. Supported: tools, logging"),
+    ):
+        result = runner.invoke(main, ["http://localhost:8080/resources", "--no-auth"])
+
+    assert result.exit_code == 2
+    error_obj = json.loads(result.output.strip())
+    assert error_obj["error"] == "INVALID_ARGUMENT"
+    assert "Server does not support 'resources'" in error_obj["message"]
+    assert "tools, logging" in error_obj["message"]
+
+
+# ---------------------------------------------------------------------------
+# Pagination tests — MCP 2025-11-25 cursor-based pagination
+# ---------------------------------------------------------------------------
+
+def test_pagination_tools_list():
+    """tools/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    # Build two pages of tools
+    tool_a = MagicMock()
+    tool_a.model_dump.return_value = {"name": "tool_a"}
+    tool_b = MagicMock()
+    tool_b.model_dump.return_value = {"name": "tool_b"}
+    tool_c = MagicMock()
+    tool_c.model_dump.return_value = {"name": "tool_c"}
+
+    page1 = MagicMock()
+    page1.tools = [tool_a, tool_b]
+    page1.nextCursor = "cursor_page2"
+
+    page2 = MagicMock()
+    page2.tools = [tool_c]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_tools = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = MagicMock()
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "tools/list", {}, {}, False
+        ))
+
+    assert len(result) == 3
+    assert result[0]["name"] == "tool_a"
+    assert result[2]["name"] == "tool_c"
+    # Verify cursor was passed on second call
+    assert mock_session.list_tools.call_count == 2
+    second_call_kwargs = mock_session.list_tools.call_args_list[1]
+    assert second_call_kwargs[1]["cursor"] == "cursor_page2"
+
+
+def test_pagination_resources_list():
+    """resources/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    res_a = MagicMock()
+    res_a.model_dump.return_value = {"uri": "file:///a.txt", "name": "a"}
+    res_b = MagicMock()
+    res_b.model_dump.return_value = {"uri": "file:///b.txt", "name": "b"}
+
+    page1 = MagicMock()
+    page1.resources = [res_a]
+    page1.nextCursor = "page2"
+
+    page2 = MagicMock()
+    page2.resources = [res_b]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_resources = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = None
+    init_result.capabilities.resources = MagicMock()
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "resources/list", {}, {}, False
+        ))
+
+    assert len(result) == 2
+    assert result[0]["name"] == "a"
+    assert result[1]["name"] == "b"
+    assert mock_session.list_resources.call_count == 2
+
+
+def test_pagination_prompts_list():
+    """prompts/list must follow nextCursor and collect all pages."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    prompt_a = MagicMock()
+    prompt_a.model_dump.return_value = {"name": "greeting"}
+    prompt_b = MagicMock()
+    prompt_b.model_dump.return_value = {"name": "farewell"}
+
+    page1 = MagicMock()
+    page1.prompts = [prompt_a]
+    page1.nextCursor = "next"
+
+    page2 = MagicMock()
+    page2.prompts = [prompt_b]
+    page2.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_prompts = AsyncMock(side_effect=[page1, page2])
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = None
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = MagicMock()
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "prompts/list", {}, {}, False
+        ))
+
+    assert len(result) == 2
+    assert result[0]["name"] == "greeting"
+    assert result[1]["name"] == "farewell"
+    assert mock_session.list_prompts.call_count == 2
+
+
+def test_pagination_single_page_no_extra_calls():
+    """When nextCursor is None on first page, no additional requests are made."""
+    from unittest.mock import patch, AsyncMock, MagicMock
+    from murl.cli import make_mcp_request
+
+    tool = MagicMock()
+    tool.model_dump.return_value = {"name": "only_tool"}
+
+    page = MagicMock()
+    page.tools = [tool]
+    page.nextCursor = None
+
+    mock_session = AsyncMock()
+    mock_session.list_tools = AsyncMock(return_value=page)
+    mock_session.initialize = AsyncMock()
+
+    init_result = MagicMock()
+    init_result.capabilities.tools = MagicMock()
+    init_result.capabilities.resources = None
+    init_result.capabilities.prompts = None
+    init_result.protocolVersion = "2025-11-25"
+    init_result.serverInfo.name = "test"
+    init_result.serverInfo.version = "1.0"
+    mock_session.initialize.return_value = init_result
+
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def mock_http_client(*args, **kwargs):
+        yield (AsyncMock(), AsyncMock(), MagicMock())
+
+    @contextlib.asynccontextmanager
+    async def mock_client_session(read, write):
+        yield mock_session
+
+    with patch("murl.cli.streamable_http_client", mock_http_client), \
+         patch("murl.cli.ClientSession", mock_client_session):
+        import asyncio
+        result = asyncio.run(make_mcp_request(
+            "http://localhost:8080", "tools/list", {}, {}, False
+        ))
+
+    assert len(result) == 1
+    assert result[0]["name"] == "only_tool"
+    # Only one call — no extra pagination requests
+    assert mock_session.list_tools.call_count == 1

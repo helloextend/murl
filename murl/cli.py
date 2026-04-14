@@ -2,12 +2,18 @@
 
 import asyncio
 import json
+import logging
 import os
 import re
 import subprocess
 import sys
 import urllib.parse
 from typing import Dict, Any, Tuple, Optional
+
+# The MCP SDK logs a noisy warning when the server returns 404 on session
+# DELETE (valid per MCP 2025-11-25 §Session Management — 404 means "session
+# already gone").  Suppress it so users don't see spurious errors.
+logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)
 
 # Python 3.10 compatibility: ExceptionGroup was added in 3.11
 try:
@@ -19,8 +25,9 @@ import click
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from murl import __version__
+import httpx as _httpx
 from murl.token_store import get_credentials, save_credentials, clear_credentials, is_expired
-from murl.auth import authorize, refresh_token, OAuthError
+from murl.auth import authorize, refresh_token, OAuthError, parse_www_authenticate
 
 # Optional TOON format support (pip install mcp-curl[toon])
 try:
@@ -212,12 +219,20 @@ def map_virtual_path_to_method(virtual_path: str, data: Dict[str, Any]) -> Tuple
         if len(parts) == 1:
             return 'resources/list', {}
         else:
-            file_path = '/'.join(parts[1:])
-            if not file_path or file_path == '':
+            resource_path = '/'.join(parts[1:])
+            if not resource_path or resource_path == '':
                 raise ValueError("Invalid resources path: path cannot be empty after /resources/")
-            if not file_path.startswith('/'):
-                file_path = '/' + file_path
-            uri = f'file://{file_path}'
+            # If the path looks like a URI scheme (contains ://), use it as-is.
+            # Otherwise, construct a file:// URI for backwards compatibility.
+            if '://' in resource_path:
+                uri = resource_path
+            else:
+                if not resource_path.startswith('/'):
+                    resource_path = '/' + resource_path
+                uri = f'file://{resource_path}'
+            # Allow -d uri=... to override the path-derived URI
+            if 'uri' in data:
+                uri = data.pop('uri')
             return 'resources/read', {'uri': uri, **data}
 
     elif category == 'prompts':
@@ -294,24 +309,53 @@ async def make_mcp_request(
                     click.echo(f"Server: {init_result.serverInfo.name} {init_result.serverInfo.version}", err=True)
                     click.echo("", err=True)
 
+                # MCP 2025-11-25 §Lifecycle/Operation: both parties MUST only use
+                # capabilities that were successfully negotiated.
+                category = method.split('/')[0]
+                if category in ("tools", "resources", "prompts"):
+                    if getattr(init_result.capabilities, category, None) is None:
+                        available = [
+                            cap for cap in ["tools", "resources", "prompts", "logging", "completions"]
+                            if getattr(init_result.capabilities, cap, None) is not None
+                        ]
+                        raise ValueError(
+                            f"Server does not support '{category}'. Supported: {', '.join(available)}"
+                        )
+
+                # List operations use cursor-based pagination (MCP 2025-11-25).
+                # We collect all pages so the caller gets the complete result set.
+                # Guard against buggy servers that repeat or cycle cursors.
+                MAX_PAGES = 1000
+
+                async def _collect_all(fetch_page, extract_items):
+                    """Paginate a list endpoint, returning all items across pages."""
+                    all_items = []
+                    cursor = None
+                    seen_cursors: set = set()
+                    for _ in range(MAX_PAGES):
+                        result = await fetch_page(cursor=cursor)
+                        all_items.extend(extract_items(result))
+                        if not result.nextCursor or result.nextCursor in seen_cursors:
+                            break
+                        seen_cursors.add(result.nextCursor)
+                        cursor = result.nextCursor
+                    return [item.model_dump(mode='json', exclude_none=True) for item in all_items]
+
                 if method == 'tools/list':
-                    result = await session.list_tools()
-                    return [tool.model_dump(mode='json', exclude_none=True) for tool in result.tools]
+                    return await _collect_all(session.list_tools, lambda r: r.tools)
                 elif method == 'tools/call':
                     tool_name = params.get('name')
                     arguments = params.get('arguments', {})
                     result = await session.call_tool(tool_name, arguments)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.content]
                 elif method == 'resources/list':
-                    result = await session.list_resources()
-                    return [resource.model_dump(mode='json', exclude_none=True) for resource in result.resources]
+                    return await _collect_all(session.list_resources, lambda r: r.resources)
                 elif method == 'resources/read':
                     uri = params.get('uri')
                     result = await session.read_resource(uri)
                     return [content.model_dump(mode='json', exclude_none=True) for content in result.contents]
                 elif method == 'prompts/list':
-                    result = await session.list_prompts()
-                    return [prompt.model_dump(mode='json', exclude_none=True) for prompt in result.prompts]
+                    return await _collect_all(session.list_prompts, lambda r: r.prompts)
                 elif method == 'prompts/get':
                     prompt_name = params.get('name')
                     arguments = params.get('arguments', {})
@@ -398,13 +442,16 @@ PIPELINES:
   murl $S/tools/search -d q=foo | jq '{id:.[0].text}' | murl $S/tools/get -d @-
 
 AUTHENTICATION:
-  OAuth 2.0 (RFC 7591) with PKCE is built in.
+  OAuth 2.0 with PKCE is built in (Dynamic Client Registration or pre-configured).
   Credentials auto-refresh. On 401, re-authenticates and retries once.
 
   murl --login https://server.com/mcp/tools    # First-time auth (opens browser)
   murl https://server.com/mcp/tools            # Uses stored token
   murl --no-auth https://server.com/mcp/tools  # Skip auth
   murl -H "Authorization: Bearer <tok>" <url>  # Manual token
+
+  Pre-configured OAuth:
+  murl --client-id ID --client-secret SECRET --callback-port 8080 --scope openid <url>
 
   Credentials: ~/.murl/credentials/<hash>.json
 
@@ -415,6 +462,10 @@ OPTIONS:
   --format <json|toon>          Output format (default: json, toon for LLMs)
   --login                      Force OAuth re-authentication
   --no-auth                    Skip all authentication
+  --client-id <id>             Pre-registered OAuth client ID (skip DCR)
+  --client-secret <secret>     Pre-registered OAuth client secret (or MURL_CLIENT_SECRET env)
+  --callback-port <port>       Fixed port for OAuth callback redirect URI
+  --scope <scopes>             OAuth scope to request (e.g. "openid profile")
   --version                    Version info
   --upgrade                    Self-upgrade via pip
   -h, --help                   This help
@@ -430,6 +481,30 @@ OUTPUT:
   exit    0=success  1=error  2=invalid args"""
     click.echo(help_text)
     ctx.exit()
+
+
+def _probe_www_authenticate(base_url: str) -> Optional[str]:
+    """Send an unauthenticated POST to the MCP endpoint to elicit a 401.
+
+    Per MCP 2025-11-25 §Protected Resource Metadata Discovery Requirements,
+    the server MUST include the resource_metadata URL in the WWW-Authenticate
+    header on 401 responses.  For servers with complex URLs (encoded ARNs,
+    query parameters), well-known URI construction from the URL alone may fail,
+    so this probe ensures we get the server-provided discovery URL.
+
+    Returns the WWW-Authenticate header value, or None if the probe fails.
+    """
+    try:
+        resp = _httpx.post(
+            base_url,
+            json={"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            timeout=10,
+        )
+        if resp.status_code == 401:
+            return resp.headers.get("www-authenticate")
+    except _httpx.HTTPError:
+        pass
+    return None
 
 
 @click.command()
@@ -450,8 +525,17 @@ OUTPUT:
               help='Output format (default: json, toon = token-efficient for LLMs)')
 @click.option('--login', is_flag=True, help='Force OAuth re-authentication')
 @click.option('--no-auth', is_flag=True, help='Skip all authentication')
+@click.option('--client-id', default=None, help='Pre-registered OAuth client ID (skips dynamic registration)')
+@click.option('--client-secret', default=None, envvar='MURL_CLIENT_SECRET',
+              help='Pre-registered OAuth client secret (or set MURL_CLIENT_SECRET)')
+@click.option('--callback-port', default=None, type=int,
+              help='Fixed port for OAuth callback (must match registered redirect URI)')
+@click.option('--scope', default=None,
+              help='OAuth scope to request (e.g. "openid profile")')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
-         verbose: bool, output_format: Optional[str], login: bool, no_auth: bool):
+         verbose: bool, output_format: Optional[str], login: bool, no_auth: bool,
+         client_id: Optional[str], client_secret: Optional[str],
+         callback_port: Optional[int], scope: Optional[str]):
     """murl - MCP Curl"""
     if url is None:
         output_error(
@@ -476,6 +560,17 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         headers = parse_headers(header_flags) if header_flags else {}
 
         # --- Auth ---
+        # Common kwargs for all authorize() calls
+        auth_kwargs = {}
+        if client_id:
+            auth_kwargs["client_id"] = client_id
+        if client_secret:
+            auth_kwargs["client_secret"] = client_secret
+        if callback_port:
+            auth_kwargs["callback_port"] = callback_port
+        if scope:
+            auth_kwargs["scope"] = scope
+
         has_auth_header = any(k.lower() == 'authorization' for k in headers)
         if not no_auth and not has_auth_header:
             if login:
@@ -489,11 +584,17 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                         creds = refresh_token(creds)
                         save_credentials(base_url, creds)
                     except OAuthError:
-                        creds = authorize(base_url)
+                        # Probe for WWW-Authenticate so discovery has the
+                        # resource_metadata URL (needed for complex server URLs).
+                        www_auth = _probe_www_authenticate(base_url)
+                        creds = authorize(base_url, www_authenticate=www_auth, **auth_kwargs)
                         save_credentials(base_url, creds)
-                headers["Authorization"] = f"Bearer {creds['access_token']}"  # always set, whether refreshed or not
+                headers["Authorization"] = f"Bearer {creds['access_token']}"
             elif login:
-                creds = authorize(base_url)
+                # Probe for WWW-Authenticate so discovery has the
+                # resource_metadata URL (needed for complex server URLs).
+                www_auth = _probe_www_authenticate(base_url)
+                creds = authorize(base_url, www_authenticate=www_auth, **auth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
 
@@ -501,18 +602,54 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         try:
             result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
         except (Exception, ExceptionGroup) as req_err:
-            err_str = str(req_err)
-            # Unwrap ExceptionGroup to check nested exceptions for 401
-            if isinstance(req_err, ExceptionGroup):
-                for exc in req_err.exceptions:
-                    exc_str = str(exc)
-                    if "401" in exc_str or "Unauthorized" in exc_str:
-                        err_str = exc_str
+            # Extract WWW-Authenticate header and 401 status from the exception chain.
+            # The MCP SDK raises httpx.HTTPStatusError (possibly wrapped in ExceptionGroup)
+            # which carries the full HTTP response including headers.
+            www_auth_header = None
+            is_401 = False
+            is_403 = False
+
+            exceptions = req_err.exceptions if isinstance(req_err, ExceptionGroup) else [req_err]
+            for exc in exceptions:
+                # httpx.HTTPStatusError has a .response attribute
+                if hasattr(exc, 'response') and hasattr(exc.response, 'status_code'):
+                    if exc.response.status_code == 401:
+                        is_401 = True
+                        www_auth_header = exc.response.headers.get("www-authenticate")
                         break
-            if not no_auth and ("401" in err_str or "Unauthorized" in err_str):
+                    if exc.response.status_code == 403:
+                        is_403 = True
+                        www_auth_header = exc.response.headers.get("www-authenticate")
+                        break
+                # Fallback: string matching for non-httpx exceptions
+                exc_str = str(exc)
+                if "401" in exc_str or "Unauthorized" in exc_str:
+                    is_401 = True
+                    break
+
+            # MCP 2025-11-25 §Authorization Flow Steps: on 401, discover
+            # metadata via WWW-Authenticate, then run full OAuth flow.
+            if not no_auth and is_401:
                 if verbose:
                     click.echo("Received 401 — initiating OAuth flow...", err=True)
-                creds = authorize(base_url)
+                    if www_auth_header:
+                        click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
+                creds = authorize(base_url, www_authenticate=www_auth_header, **auth_kwargs)
+                save_credentials(base_url, creds)
+                headers["Authorization"] = f"Bearer {creds['access_token']}"
+                result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
+            # MCP 2025-11-25 §Scope Challenge Handling: on 403 with explicit
+            # insufficient_scope error, parse required scopes and re-authorize.
+            elif not no_auth and is_403:
+                www_params = parse_www_authenticate(www_auth_header) if www_auth_header else {}
+                if www_params.get("error") != "insufficient_scope" or not www_params.get("scope"):
+                    raise
+                if verbose:
+                    click.echo("Received 403 insufficient_scope — re-authorizing...", err=True)
+                    click.echo(f"WWW-Authenticate: {www_auth_header}", err=True)
+                # Merge scope override into auth_kwargs to avoid passing scope twice.
+                reauth_kwargs = {**auth_kwargs, "scope": www_params["scope"]}
+                creds = authorize(base_url, www_authenticate=www_auth_header, **reauth_kwargs)
                 save_credentials(base_url, creds)
                 headers["Authorization"] = f"Bearer {creds['access_token']}"
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
