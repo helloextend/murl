@@ -229,9 +229,17 @@ def discover_metadata(server_url: str) -> dict:
 
         if resp.status_code == 200:
             try:
-                return resp.json()
+                meta = resp.json()
             except json.JSONDecodeError as exc:
                 raise OAuthError("Invalid JSON in OAuth metadata response") from exc
+            # Tag the source so callers (e.g. authorize()'s PKCE check) can
+            # distinguish RFC 8414 from OIDC and warn-rather-than-fail when an
+            # OIDC document omits code_challenge_methods_supported.
+            if isinstance(meta, dict):
+                meta["_discovery_source"] = (
+                    "oidc" if "openid-configuration" in url else "rfc8414"
+                )
+            return meta
 
     # All attempts failed — fall back to defaults
     return {

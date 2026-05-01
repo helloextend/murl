@@ -239,7 +239,8 @@ class TestDiscoverMetadata:
             mock_get.return_value = mock_resp
 
             result = discover_metadata("https://example.com/mcp")
-            assert result == meta
+            assert result["token_endpoint"] == meta["token_endpoint"]
+            assert result["_discovery_source"] == "rfc8414"
             # First URL tried should be path-aware RFC 8414
             first_url = mock_get.call_args_list[0][0][0]
             assert "/.well-known/oauth-authorization-server/mcp" in first_url
@@ -295,8 +296,47 @@ class TestDiscoverMetadata:
             mock_get.side_effect = [not_found, not_found, not_found, host_root]
 
             result = discover_metadata("https://mcp.example.com/v1/mcp")
-            assert result == meta
+            assert result["token_endpoint"] == meta["token_endpoint"]
+            assert result["_discovery_source"] == "rfc8414"
             assert mock_get.call_args_list[3][0][0] == "https://mcp.example.com/.well-known/oauth-authorization-server"
+
+    def test_discovery_source_tagged_rfc8414(self):
+        """RFC 8414 success tags the doc as rfc8414 so the PKCE check is strict."""
+        meta = {
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = meta
+            mock_get.return_value = mock_resp
+
+            result = discover_metadata("https://example.com/mcp")
+            assert result["_discovery_source"] == "rfc8414"
+
+    def test_discovery_source_tagged_oidc(self):
+        """OIDC fallback tags the doc as oidc so the PKCE check warn-and-proceeds.
+
+        Without this tag, an OIDC document that omits code_challenge_methods_supported
+        would cause the PKCE check in authorize() to hard-fail rather than warn.
+        """
+        meta = {
+            "authorization_endpoint": "https://example.com/authorize",
+            "token_endpoint": "https://example.com/token",
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            not_found = MagicMock()
+            not_found.status_code = 404
+            oidc_resp = MagicMock()
+            oidc_resp.status_code = 200
+            oidc_resp.json.return_value = meta
+            # First (RFC 8414 path-aware) fails, second (OIDC path-aware) succeeds.
+            mock_get.side_effect = [not_found, oidc_resp]
+
+            result = discover_metadata("https://example.com/mcp")
+            assert result["_discovery_source"] == "oidc"
+            assert "openid-configuration" in mock_get.call_args_list[1][0][0]
 
 
 # ---------------------------------------------------------------------------
