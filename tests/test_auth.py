@@ -274,6 +274,30 @@ class TestDiscoverMetadata:
             # Should have tried multiple URLs (RFC 8414 + OIDC)
             assert mock_get.call_count >= 2
 
+    def test_host_level_fallback_for_pathed_url(self):
+        """Pathed server URL falls back to host-level metadata when path-aware URLs fail.
+
+        Models mcp.atlassian.com: path-prefixed well-known URLs return 401/404,
+        but the host root publishes a single OAuth metadata document.
+        """
+        meta = {
+            "authorization_endpoint": "https://mcp.example.com/authorize",
+            "token_endpoint": "https://mcp.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            not_found = MagicMock()
+            not_found.status_code = 404
+            host_root = MagicMock()
+            host_root.status_code = 200
+            host_root.json.return_value = meta
+            # Three path-aware attempts fail, then the host-level RFC 8414 URL succeeds.
+            mock_get.side_effect = [not_found, not_found, not_found, host_root]
+
+            result = discover_metadata("https://mcp.example.com/v1/mcp")
+            assert result == meta
+            assert mock_get.call_args_list[3][0][0] == "https://mcp.example.com/.well-known/oauth-authorization-server"
+
 
 # ---------------------------------------------------------------------------
 # register_client
@@ -606,6 +630,34 @@ class TestDiscoverAuthServerMetadata:
 
             with pytest.raises(OAuthError, match="Could not discover Authorization Server"):
                 discover_auth_server_metadata("https://auth.example.com")
+
+    def test_host_level_fallback_for_pathed_issuer(self):
+        """Issuer with path falls back to host-level metadata when path-aware URLs fail.
+
+        Models mcp.atlassian.com: path-prefixed well-known URLs return 401/404,
+        but the host root publishes a single OAuth metadata document.
+        """
+        meta = {
+            "issuer": "https://mcp.example.com",
+            "authorization_endpoint": "https://mcp.example.com/authorize",
+            "token_endpoint": "https://mcp.example.com/token",
+            "code_challenge_methods_supported": ["S256"],
+        }
+        with patch("murl.auth.httpx.get") as mock_get:
+            not_found = MagicMock()
+            not_found.status_code = 404
+            host_root = MagicMock()
+            host_root.status_code = 200
+            host_root.json.return_value = meta
+            # Three path-aware attempts fail, then the host-level RFC 8414 URL succeeds.
+            mock_get.side_effect = [not_found, not_found, not_found, host_root]
+
+            result = discover_auth_server_metadata("https://mcp.example.com/v1/mcp")
+            assert result["token_endpoint"] == "https://mcp.example.com/token"
+            assert result["code_challenge_methods_supported"] == ["S256"]
+            assert result["_discovery_source"] == "rfc8414"
+            # Fourth attempt should be the host-level RFC 8414 URL.
+            assert mock_get.call_args_list[3][0][0] == "https://mcp.example.com/.well-known/oauth-authorization-server"
 
 
 # ---------------------------------------------------------------------------
