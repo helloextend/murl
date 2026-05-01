@@ -135,10 +135,16 @@ def discover_auth_server_metadata(issuer_url: str) -> dict:
       1. /.well-known/oauth-authorization-server/tenant1  (RFC 8414)
       2. /.well-known/openid-configuration/tenant1        (OIDC path insertion)
       3. /tenant1/.well-known/openid-configuration        (OIDC path append)
+      4. /.well-known/oauth-authorization-server          (host-level fallback)
+      5. /.well-known/openid-configuration                (host-level OIDC fallback)
 
     For issuer without path (e.g. https://auth.example.com), MUST try:
       1. /.well-known/oauth-authorization-server           (RFC 8414)
       2. /.well-known/openid-configuration                 (OIDC)
+
+    Host-level fallback covers servers (e.g. mcp.atlassian.com) that publish
+    a single metadata document at the host root and route 401/404 for
+    path-prefixed well-known URLs.
     """
     parsed = urllib.parse.urlparse(issuer_url)
     base = f"{parsed.scheme}://{parsed.netloc}"
@@ -149,6 +155,8 @@ def discover_auth_server_metadata(issuer_url: str) -> dict:
         urls_to_try.append(f"{base}/.well-known/oauth-authorization-server{path}")
         urls_to_try.append(f"{base}/.well-known/openid-configuration{path}")
         urls_to_try.append(f"{base}{path}/.well-known/openid-configuration")
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration")
     else:
         urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
         urls_to_try.append(f"{base}/.well-known/openid-configuration")
@@ -200,12 +208,15 @@ def discover_metadata(server_url: str) -> dict:
     base = f"{parsed.scheme}://{parsed.netloc}"
     path = parsed.path.rstrip("/")
 
-    # Try RFC 8414 then OIDC, path-aware
+    # Try RFC 8414 then OIDC, path-aware, with host-level fallback for servers
+    # (e.g. mcp.atlassian.com) that publish metadata only at the host root.
     urls_to_try = []
     if path:
         urls_to_try.append(f"{base}/.well-known/oauth-authorization-server{path}")
         urls_to_try.append(f"{base}/.well-known/openid-configuration{path}")
         urls_to_try.append(f"{base}{path}/.well-known/openid-configuration")
+        urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
+        urls_to_try.append(f"{base}/.well-known/openid-configuration")
     else:
         urls_to_try.append(f"{base}/.well-known/oauth-authorization-server")
         urls_to_try.append(f"{base}/.well-known/openid-configuration")
@@ -218,9 +229,17 @@ def discover_metadata(server_url: str) -> dict:
 
         if resp.status_code == 200:
             try:
-                return resp.json()
+                meta = resp.json()
             except json.JSONDecodeError as exc:
                 raise OAuthError("Invalid JSON in OAuth metadata response") from exc
+            # Tag the source so callers (e.g. authorize()'s PKCE check) can
+            # distinguish RFC 8414 from OIDC and warn-rather-than-fail when an
+            # OIDC document omits code_challenge_methods_supported.
+            if isinstance(meta, dict):
+                meta["_discovery_source"] = (
+                    "oidc" if "openid-configuration" in url else "rfc8414"
+                )
+            return meta
 
     # All attempts failed — fall back to defaults
     return {
