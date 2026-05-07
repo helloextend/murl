@@ -430,8 +430,9 @@ def _validate_auth_server_origin(auth_server_url: str, server_url: str) -> None:
             f"Authorization server hostname '{auth_parsed.hostname}' does not match "
             f"MCP server hostname '{resource_parsed.hostname}'. "
             f"This could indicate a malicious server redirect. "
-            f"If this is expected, use --client-id to supply pre-registered credentials "
-            f"and bypass discovery."
+            f"If this is expected (e.g. the resource server and auth server are on "
+            f"different domains), supply pre-registered credentials with --client-id "
+            f"to bypass this check."
         )
 
 
@@ -504,7 +505,13 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
         # RFC 9728 §3: validate that the authorization server's hostname
         # matches the MCP server to prevent redirect attacks.
-        _validate_auth_server_origin(issuer_url, server_url)
+        # Skip when the caller supplies pre-registered credentials (--client-id):
+        # they have already established the trust relationship out-of-band, so
+        # the cross-domain check would only block legitimate deployments where
+        # the resource server and auth server are intentionally on different
+        # domains (e.g. AWS AgentCore + Okta).
+        if not client_id:
+            _validate_auth_server_origin(issuer_url, server_url)
 
         # Fetch auth server metadata (RFC 8414 + OIDC fallback).
         # Errors here propagate — the issuer was explicitly advertised.
