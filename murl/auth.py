@@ -503,13 +503,14 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
         issuer_url = auth_servers[0]
 
-        # RFC 9728 §3: validate that the authorization server's hostname
-        # matches the MCP server to prevent redirect attacks.
-        # Skip when the caller supplies pre-registered credentials (--client-id):
-        # they have already established the trust relationship out-of-band, so
-        # the cross-domain check would only block legitimate deployments where
-        # the resource server and auth server are intentionally on different
-        # domains (e.g. AWS AgentCore + Okta).
+        # Validate that the authorization server's hostname matches the MCP
+        # server to prevent a malicious resource server from redirecting auth
+        # to an attacker-controlled AS. Skip when the caller supplies
+        # pre-registered credentials (--client-id): they have already
+        # established the trust relationship out-of-band, so the cross-domain
+        # check would only block legitimate deployments where the resource
+        # server and auth server are intentionally on different domains
+        # (e.g. AWS AgentCore + Okta). PKCE + state still apply.
         if not client_id:
             _validate_auth_server_origin(issuer_url, server_url)
 
