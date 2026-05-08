@@ -1091,11 +1091,22 @@ class TestAuthorize:
         mock_browser.return_value = True
         mock_server.return_value = "test_auth_code"
 
-        # Should NOT raise OAuthError despite cross-domain auth server
-        creds = authorize(
-            "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3A.../invocations",
-            client_id="0oay9piaejrWXS8ZT1d7",
-            client_secret="my-secret",
-            callback_port=9999,
-        )
+        from unittest.mock import patch as _patch
+
+        # Should NOT raise OAuthError despite cross-domain auth server,
+        # but MUST emit a warning naming the unvalidated issuer.
+        with _patch("click.echo") as mock_echo:
+            creds = authorize(
+                "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3A.../invocations",
+                client_id="0oay9piaejrWXS8ZT1d7",
+                client_secret="my-secret",
+                callback_port=9999,
+            )
         assert creds["access_token"] == "at_agentcore"
+        # Verify the warning was emitted and names the issuer
+        warning_calls = [
+            str(call) for call in mock_echo.call_args_list
+            if "skipping same-origin" in str(call)
+        ]
+        assert warning_calls, "Expected a same-origin-skip warning to be printed"
+        assert "oktapreview.com" in warning_calls[0]

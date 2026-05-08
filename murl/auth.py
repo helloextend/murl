@@ -506,13 +506,19 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
         # Validate that the authorization server's hostname matches the MCP
         # server to prevent a malicious resource server from redirecting auth
         # to an attacker-controlled AS. Skip when the caller supplies
-        # pre-registered credentials (--client-id): they have already
-        # established the trust relationship out-of-band, so the cross-domain
-        # check would only block legitimate deployments where the resource
-        # server and auth server are intentionally on different domains
-        # (e.g. AWS AgentCore + Okta). PKCE + state still apply.
+        # pre-registered credentials (--client-id), but warn loudly so the
+        # user can verify the issuer is actually their provider — a compromised
+        # resource server could advertise a foreign AS and this check is the
+        # only guard against that redirect.
         if not client_id:
             _validate_auth_server_origin(issuer_url, server_url)
+        else:
+            click.echo(
+                f"Warning: skipping same-origin check for authorization server "
+                f"{issuer_url!r} (advertised by {server_url!r}). "
+                f"Pre-registered --client-id supplied; verify this is your expected provider.",
+                err=True,
+            )
 
         # Fetch auth server metadata (RFC 8414 + OIDC fallback).
         # Errors here propagate — the issuer was explicitly advertised.
