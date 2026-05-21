@@ -504,7 +504,20 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
         # RFC 9728 §3: validate that the authorization server's hostname
         # matches the MCP server to prevent redirect attacks.
-        _validate_auth_server_origin(issuer_url, server_url)
+        #
+        # Skip the origin check when the caller supplies pre-registered
+        # credentials (--client-id). The check defends against a malicious
+        # MCP endpoint steering OAuth to an attacker-controlled AS via a
+        # crafted `authorization_servers` value during dynamic client
+        # registration. When the caller has already pinned a known
+        # client_id out-of-band, that registration-time attack surface is
+        # gone — the AS is implicitly trusted by virtue of being the
+        # issuer that minted credentials for this client. Org-level MCP
+        # setups routinely run the AS on a separate hostname from the
+        # resource server (Okta tenant vs. service runtime), which is
+        # the legitimate cross-origin case this branch unblocks.
+        if not client_id:
+            _validate_auth_server_origin(issuer_url, server_url)
 
         # Fetch auth server metadata (RFC 8414 + OIDC fallback).
         # Errors here propagate — the issuer was explicitly advertised.

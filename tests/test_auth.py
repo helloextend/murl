@@ -1047,3 +1047,56 @@ class TestAuthorize:
 
         with pytest.raises(OAuthError, match="does not match"):
             authorize("https://legit-server.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_cross_origin_allowed_when_client_id_supplied(
+        self, mock_get, mock_post, mock_browser, mock_server
+    ):
+        """Origin check skipped when --client-id is supplied.
+
+        Org-level MCP setups routinely run the auth server on a separate
+        hostname from the resource server (e.g. Okta tenant vs. service
+        runtime). When the caller has already pinned a known client_id
+        out-of-band, the registration-time attack surface the origin
+        check defends against is gone — the AS is implicitly trusted as
+        the issuer that minted credentials for this client.
+        """
+        # Two-phase: resource metadata advertises a cross-origin AS, then
+        # the AS itself serves OAuth metadata.
+        resource_meta_resp = MagicMock()
+        resource_meta_resp.status_code = 200
+        resource_meta_resp.json.return_value = {
+            "authorization_servers": ["https://auth.example.com/oauth2/ABC"],
+        }
+        as_meta_resp = MagicMock()
+        as_meta_resp.status_code = 200
+        as_meta_resp.json.return_value = {
+            "authorization_endpoint": "https://auth.example.com/oauth2/ABC/v1/authorize",
+            "token_endpoint": "https://auth.example.com/oauth2/ABC/v1/token",
+            "code_challenge_methods_supported": ["S256"],
+        }
+        mock_get.side_effect = [resource_meta_resp, as_meta_resp]
+
+        # Token exchange returns a real-shaped token so authorize() can complete.
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.json.return_value = {
+            "access_token": "tok",
+            "expires_in": 3600,
+        }
+        mock_post.return_value = token_resp
+
+        # Pretend the user completed the browser flow.
+        mock_server.return_value = "auth-code"
+
+        # No origin OAuthError; authorize() completes with the supplied client_id.
+        creds = authorize(
+            "https://legit-server.com/mcp",
+            client_id="pre-registered-client",
+            callback_port=8080,
+        )
+        assert creds["client_id"] == "pre-registered-client"
+        assert creds["access_token"] == "tok"
