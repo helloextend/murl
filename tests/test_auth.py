@@ -1047,3 +1047,66 @@ class TestAuthorize:
 
         with pytest.raises(OAuthError, match="does not match"):
             authorize("https://legit-server.com/mcp")
+
+    @patch("murl.auth._run_callback_server")
+    @patch("murl.auth.webbrowser.open")
+    @patch("murl.auth.httpx.post")
+    @patch("murl.auth.httpx.get")
+    def test_cross_origin_auth_server_allowed_with_client_id(self, mock_get, mock_post, mock_browser, mock_server):
+        """Pre-registered credentials bypass the same-origin check.
+
+        Deployments like AWS AgentCore + Okta intentionally split the resource
+        server (AgentCore, *.amazonaws.com) and the auth server (Okta,
+        *.okta.com) across different domains. When the caller supplies
+        --client-id they have established the trust relationship out-of-band,
+        so the cross-domain check would only block legitimate usage.
+        """
+        # Resource server: agentcore.amazonaws.com
+        # Auth server:     extend-testing-sandbox.oktapreview.com — different domain
+        resource_meta_resp = MagicMock()
+        resource_meta_resp.status_code = 200
+        resource_meta_resp.json.return_value = {
+            "authorization_servers": ["https://extend-testing-sandbox.oktapreview.com/oauth2/default"],
+        }
+
+        as_meta_resp = MagicMock()
+        as_meta_resp.status_code = 200
+        as_meta_resp.json.return_value = {
+            "issuer": "https://extend-testing-sandbox.oktapreview.com/oauth2/default",
+            "authorization_endpoint": "https://extend-testing-sandbox.oktapreview.com/oauth2/default/v1/authorize",
+            "token_endpoint": "https://extend-testing-sandbox.oktapreview.com/oauth2/default/v1/token",
+            "code_challenge_methods_supported": ["S256"],
+        }
+
+        mock_get.side_effect = [resource_meta_resp, as_meta_resp]
+
+        token_resp = MagicMock()
+        token_resp.status_code = 200
+        token_resp.json.return_value = {
+            "access_token": "at_agentcore",
+            "refresh_token": "rt_agentcore",
+            "expires_in": 3600,
+        }
+        mock_post.return_value = token_resp
+        mock_browser.return_value = True
+        mock_server.return_value = "test_auth_code"
+
+        from unittest.mock import patch as _patch
+
+        # Should NOT raise OAuthError despite cross-domain auth server,
+        # but MUST emit a warning naming the unvalidated issuer.
+        with _patch("click.echo") as mock_echo:
+            creds = authorize(
+                "https://bedrock-agentcore.us-east-1.amazonaws.com/runtimes/arn%3A.../invocations",
+                client_id="0oay9piaejrWXS8ZT1d7",
+                client_secret="my-secret",
+                callback_port=9999,
+            )
+        assert creds["access_token"] == "at_agentcore"
+        # Verify the warning was emitted and names the issuer
+        warning_calls = [
+            str(call) for call in mock_echo.call_args_list
+            if "skipping same-origin" in str(call)
+        ]
+        assert warning_calls, "Expected a same-origin-skip warning to be printed"
+        assert "oktapreview.com" in warning_calls[0]

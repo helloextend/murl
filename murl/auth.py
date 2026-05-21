@@ -430,8 +430,9 @@ def _validate_auth_server_origin(auth_server_url: str, server_url: str) -> None:
             f"Authorization server hostname '{auth_parsed.hostname}' does not match "
             f"MCP server hostname '{resource_parsed.hostname}'. "
             f"This could indicate a malicious server redirect. "
-            f"If this is expected, use --client-id to supply pre-registered credentials "
-            f"and bypass discovery."
+            f"If this is expected (e.g. the resource server and auth server are on "
+            f"different domains), supply pre-registered credentials with --client-id "
+            f"to bypass this check."
         )
 
 
@@ -502,9 +503,22 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
 
         issuer_url = auth_servers[0]
 
-        # RFC 9728 §3: validate that the authorization server's hostname
-        # matches the MCP server to prevent redirect attacks.
-        _validate_auth_server_origin(issuer_url, server_url)
+        # Validate that the authorization server's hostname matches the MCP
+        # server to prevent a malicious resource server from redirecting auth
+        # to an attacker-controlled AS. Skip when the caller supplies
+        # pre-registered credentials (--client-id), but warn loudly so the
+        # user can verify the issuer is actually their provider — a compromised
+        # resource server could advertise a foreign AS and this check is the
+        # only guard against that redirect.
+        if not client_id:
+            _validate_auth_server_origin(issuer_url, server_url)
+        else:
+            click.echo(
+                f"Warning: skipping same-origin check for authorization server "
+                f"{issuer_url!r} (advertised by {server_url!r}). "
+                f"Pre-registered --client-id supplied; verify this is your expected provider.",
+                err=True,
+            )
 
         # Fetch auth server metadata (RFC 8414 + OIDC fallback).
         # Errors here propagate — the issuer was explicitly advertised.
