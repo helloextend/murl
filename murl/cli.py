@@ -263,6 +263,137 @@ def parse_headers(header_flags: Tuple[str, ...]) -> Dict[str, str]:
     return headers
 
 
+# --- Text-envelope unwrap, paginate, and config discovery ---
+
+def unwrap_text_envelope(result: Any) -> Tuple[Any, bool]:
+    """Unwrap an MCP {type:"text", text:"<json>"} response when possible.
+
+    Many MCP tool servers stringify their response payload and wrap it in a
+    single text content block. The caller almost always wants the parsed inner
+    value. Returns (unwrapped, did_unwrap). Idempotent: a result that is not a
+    single-text envelope (or whose text isn't JSON) is returned unchanged.
+    """
+    if not isinstance(result, list) or len(result) != 1:
+        return result, False
+    item = result[0]
+    if not isinstance(item, dict) or item.get("type") != "text":
+        return result, False
+    text = item.get("text")
+    if not isinstance(text, str):
+        return result, False
+    try:
+        return json.loads(text), True
+    except (json.JSONDecodeError, ValueError):
+        return result, False
+
+
+# Auth-failure signals that appear inside an MCP tool response body (HTTP 200
+# but the downstream provider rejected the credential). Matching these lets us
+# exit with a structured AUTH_FAILED instead of forcing callers to substring-
+# match on stdout.
+_TOOL_AUTH_FAILURE_MARKERS = (
+    "invalid_token",
+    "AUTH_FAILED",
+    "Unauthorized",
+    "authentication failed",
+)
+
+
+def detect_tool_auth_failure(unwrapped: Any) -> Optional[str]:
+    """Return a short failure description if the response body signals an auth
+    failure, otherwise None.
+
+    Inspects common shapes: a top-level {error: {...}} object, or any string
+    field containing a known auth-failure marker. Bounded recursion keeps this
+    cheap on large bodies.
+    """
+    def _walk(node: Any, depth: int = 0) -> Optional[str]:
+        if depth > 6:
+            return None
+        if isinstance(node, dict):
+            err = node.get("error")
+            if isinstance(err, dict):
+                code = str(err.get("code", ""))
+                msg = str(err.get("message", ""))
+                if any(m.lower() in (code + " " + msg).lower() for m in _TOOL_AUTH_FAILURE_MARKERS):
+                    return msg or code or "auth failure"
+            for v in node.values():
+                hit = _walk(v, depth + 1)
+                if hit:
+                    return hit
+        elif isinstance(node, list):
+            for v in node[:50]:
+                hit = _walk(v, depth + 1)
+                if hit:
+                    return hit
+        elif isinstance(node, str):
+            low = node.lower()
+            for marker in _TOOL_AUTH_FAILURE_MARKERS:
+                if marker.lower() in low:
+                    return marker
+        return None
+
+    return _walk(unwrapped)
+
+
+def find_mcp_config(start_dir: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    """Walk up from start_dir (default: CWD) looking for a .mcp.json file.
+
+    Returns the parsed config dict, or None if no file is found or it fails to
+    parse. Stops at the filesystem root or the user's home directory, whichever
+    comes first.
+    """
+    cwd = os.path.abspath(start_dir or os.getcwd())
+    home = os.path.expanduser("~")
+    while True:
+        candidate = os.path.join(cwd, ".mcp.json")
+        if os.path.isfile(candidate):
+            try:
+                with open(candidate) as f:
+                    return json.load(f)
+            except (OSError, json.JSONDecodeError):
+                return None
+        parent = os.path.dirname(cwd)
+        if parent == cwd or cwd == home:
+            return None
+        cwd = parent
+
+
+def mcp_config_defaults(base_url: str, config: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Extract OAuth defaults for base_url from a parsed .mcp.json.
+
+    Matches the server entry whose `url` exactly equals base_url (after URL
+    decoding both, since AgentCore ARNs are percent-encoded in practice).
+    Trailing slashes are normalized; query strings are not — the caller's URL
+    must include the same query as the config entry, otherwise no match.
+    Returns at most {client_id, callback_port} for filling missing flags.
+    """
+    if not config:
+        return {}
+    servers = config.get("mcpServers")
+    if not isinstance(servers, dict):
+        return {}
+    target = urllib.parse.unquote(base_url).rstrip("/")
+    for entry in servers.values():
+        if not isinstance(entry, dict):
+            continue
+        entry_url = entry.get("url")
+        if not isinstance(entry_url, str):
+            continue
+        decoded = urllib.parse.unquote(entry_url).rstrip("/")
+        if decoded != target:
+            continue
+        oauth = entry.get("oauth") or {}
+        out: Dict[str, Any] = {}
+        if isinstance(oauth.get("clientId"), str):
+            out["client_id"] = oauth["clientId"]
+        cb = oauth.get("callbackPort")
+        if isinstance(cb, int):
+            out["callback_port"] = cb
+        return out
+    return {}
+
+
 async def make_mcp_request(
     base_url: str,
     method: str,
@@ -466,6 +597,9 @@ OPTIONS:
   --client-secret <secret>     Pre-registered OAuth client secret (or MURL_CLIENT_SECRET env)
   --callback-port <port>       Fixed port for OAuth callback redirect URI
   --scope <scopes>             OAuth scope to request (e.g. "openid profile")
+  --raw                        Skip auto-unwrap and cursor follow; emit the protocol response verbatim
+  --max-pages <N>              Cap auto-paginated tools/call follow at N pages (default 1000)
+  --no-mcp-config              Skip .mcp.json discovery for OAuth client defaults
   --version                    Version info
   --upgrade                    Self-upgrade via pip
   -h, --help                   This help
@@ -532,10 +666,17 @@ def _probe_www_authenticate(base_url: str) -> Optional[str]:
               help='Fixed port for OAuth callback (must match registered redirect URI)')
 @click.option('--scope', default=None,
               help='OAuth scope to request (e.g. "openid profile")')
+@click.option('--raw', is_flag=True,
+              help='Skip auto-unwrap and auto-paginate; emit the protocol response verbatim')
+@click.option('--max-pages', default=1000, type=int, show_default=True,
+              help='Maximum pages to follow when a tools/call response carries nextCursor')
+@click.option('--no-mcp-config', is_flag=True,
+              help='Skip .mcp.json discovery for OAuth client defaults')
 def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[str, ...],
          verbose: bool, output_format: Optional[str], login: bool, no_auth: bool,
          client_id: Optional[str], client_secret: Optional[str],
-         callback_port: Optional[int], scope: Optional[str]):
+         callback_port: Optional[int], scope: Optional[str],
+         raw: bool, max_pages: int, no_mcp_config: bool):
     """murl - MCP Curl"""
     if url is None:
         output_error(
@@ -558,6 +699,21 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
         data = parse_data_flags(data_flags) if data_flags else {}
         method, params = map_virtual_path_to_method(virtual_path, data)
         headers = parse_headers(header_flags) if header_flags else {}
+
+        # --- .mcp.json defaults ---
+        # When the caller didn't pass --client-id / --callback-port, look for a
+        # sibling .mcp.json (walking up from CWD) and pick them up from the
+        # matching server entry. Mirrors Claude Code's discovery semantics.
+        if not no_mcp_config:
+            cfg_defaults = mcp_config_defaults(base_url, find_mcp_config())
+            if client_id is None and "client_id" in cfg_defaults:
+                client_id = cfg_defaults["client_id"]
+                if verbose:
+                    click.echo(f"Using client_id from .mcp.json: {client_id}", err=True)
+            if callback_port is None and "callback_port" in cfg_defaults:
+                callback_port = cfg_defaults["callback_port"]
+                if verbose:
+                    click.echo(f"Using callback_port from .mcp.json: {callback_port}", err=True)
 
         # --- Auth ---
         # Common kwargs for all authorize() calls
@@ -655,6 +811,77 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                 result = asyncio.run(make_mcp_request(base_url, method, params, headers, verbose))
             else:
                 raise
+
+        # --- Post-process: unwrap, follow cursors, detect tool-level auth failure ---
+        # By default, tools/call responses are unwrapped from their {type:"text"}
+        # envelope and any nextCursor is followed transparently. --raw opts out
+        # of both, returning the raw protocol response. List endpoints and
+        # resources/read have their own handling upstream.
+        if not raw and method == 'tools/call':
+            unwrapped, did_unwrap = unwrap_text_envelope(result)
+
+            if did_unwrap and isinstance(unwrapped, dict) and unwrapped.get("hasMore") and unwrapped.get("nextCursor"):
+                # Locate the single array field carrying page items. The MCP
+                # convention is {<items_field>: [...], hasMore, nextCursor}.
+                array_keys = [k for k, v in unwrapped.items() if isinstance(v, list)]
+                if len(array_keys) == 1:
+                    items_key = array_keys[0]
+                    all_items = list(unwrapped[items_key])
+                    seen_cursors: set = set()
+                    cursor = unwrapped.get("nextCursor")
+                    pages = 1
+                    while (unwrapped.get("hasMore") and cursor
+                           and cursor not in seen_cursors and pages < max_pages):
+                        seen_cursors.add(cursor)
+                        next_params = {
+                            'name': params['name'],
+                            'arguments': {**params.get('arguments', {}), 'cursor': cursor},
+                        }
+                        # Strip page-size hints on cursor calls — many MCP
+                        # tools reject them when a cursor is supplied because
+                        # the cursor already encodes that context.
+                        for k in ('pageSize', 'perPage', 'status'):
+                            next_params['arguments'].pop(k, None)
+                        next_raw = asyncio.run(make_mcp_request(base_url, method, next_params, headers, verbose))
+                        next_unwrapped, _ = unwrap_text_envelope(next_raw)
+                        # Detect a mid-pagination auth failure before deciding
+                        # whether to break: an error body looks structurally
+                        # similar to an "end of pagination" body (no items_key),
+                        # and silently breaking would return partial results
+                        # with no signal that auth expired mid-loop.
+                        page_failure = detect_tool_auth_failure(next_unwrapped)
+                        if page_failure:
+                            output_error(
+                                error_type="AUTH_FAILED",
+                                message=f"Tool reported authentication failure during pagination at page {pages + 1}: {page_failure}",
+                                exit_code=ErrorCode.GENERAL_ERROR,
+                                suggestion="Re-authenticate with `murl --login <url>` and retry."
+                            )
+                            return
+                        if not isinstance(next_unwrapped, dict) or items_key not in next_unwrapped:
+                            break
+                        all_items.extend(next_unwrapped.get(items_key, []))
+                        cursor = next_unwrapped.get("nextCursor")
+                        unwrapped = next_unwrapped
+                        pages += 1
+                    # Emit the flat items list; the NDJSON output branch below
+                    # will write one item per line.
+                    result = all_items
+                else:
+                    # Ambiguous page shape — surface the unwrapped envelope as-is.
+                    result = unwrapped
+            elif did_unwrap:
+                result = unwrapped
+
+            failure = detect_tool_auth_failure(result)
+            if failure:
+                output_error(
+                    error_type="AUTH_FAILED",
+                    message=f"Tool reported authentication failure: {failure}",
+                    exit_code=ErrorCode.GENERAL_ERROR,
+                    suggestion="Re-authenticate with `murl --login <url>` and retry."
+                )
+                return
 
         # --- Output ---
         if verbose:
