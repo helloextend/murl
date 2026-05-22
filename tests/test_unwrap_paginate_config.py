@@ -70,6 +70,15 @@ def test_detect_tool_auth_failure_clean_response():
     assert detect_tool_auth_failure(body) is None
 
 
+def test_detect_tool_auth_failure_catches_error_inside_items_envelope():
+    # Regression for CodeRabbit finding on PR #7: an error response received
+    # mid-pagination must be detectable so the loop surfaces it rather than
+    # returning partial results. The body has no items_key (would otherwise
+    # break the loop silently) — only an error object.
+    body = {"error": {"code": "invalid_token", "message": "expired mid-loop"}}
+    assert detect_tool_auth_failure(body) is not None
+
+
 def test_detect_tool_auth_failure_bounded_recursion():
     # Build a deeply nested object — should not blow up and should not match.
     deep = {"a": {"b": {"c": {"d": {"e": {"f": {"g": "ok"}}}}}}}

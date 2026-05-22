@@ -844,6 +844,20 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                             next_params['arguments'].pop(k, None)
                         next_raw = asyncio.run(make_mcp_request(base_url, method, next_params, headers, verbose))
                         next_unwrapped, _ = unwrap_text_envelope(next_raw)
+                        # Detect a mid-pagination auth failure before deciding
+                        # whether to break: an error body looks structurally
+                        # similar to an "end of pagination" body (no items_key),
+                        # and silently breaking would return partial results
+                        # with no signal that auth expired mid-loop.
+                        page_failure = detect_tool_auth_failure(next_unwrapped)
+                        if page_failure:
+                            output_error(
+                                error_type="AUTH_FAILED",
+                                message=f"Tool reported authentication failure during pagination at page {pages + 1}: {page_failure}",
+                                exit_code=ErrorCode.GENERAL_ERROR,
+                                suggestion="Re-authenticate with `murl --login <url>` and retry."
+                            )
+                            return
                         if not isinstance(next_unwrapped, dict) or items_key not in next_unwrapped:
                             break
                         all_items.extend(next_unwrapped.get(items_key, []))
