@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1
+
+### Fixed
+
+- **`--upgrade` no longer silently downgrades fork users.** The flag
+  previously ran `pip install --upgrade mcp-curl`, which hits PyPI where
+  the published version (0.3.2) lags far behind the helloextend fork.
+  Anyone running `murl --upgrade` on a fork install would get rolled
+  back to 0.3.2 and lose every feature shipped since.  Now pinned to
+  `mcp-curl[keychain,toon] @ git+https://github.com/helloextend/murl.git`
+  so `--upgrade` actually upgrades.
+
 ## 0.5.0
 
 **Breaking — `tools/call` output shape changed by default.**

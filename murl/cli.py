@@ -518,21 +518,27 @@ def print_version(ctx, param, value):
     ctx.exit()
 
 
+# The internal fork is the source of truth for this CLI. PyPI publishes a
+# `mcp-curl` package that lags well behind the fork's master, so upgrading
+# against PyPI silently downgrades fork users. Pin --upgrade to the fork.
+UPGRADE_SOURCE = "mcp-curl[keychain,toon] @ git+https://github.com/helloextend/murl.git"
+
+
 def run_upgrade(ctx, param, value):
     """Run the upgrade process."""
     if not value or ctx.resilient_parsing:
         return
 
-    click.echo("Upgrading murl...")
+    click.echo("Upgrading murl from helloextend/murl...")
 
     def show_error_and_exit(error_msg: str):
         click.echo(f"Error: {error_msg}", err=True)
-        click.echo("Please try upgrading manually with: pip install --upgrade mcp-curl", err=True)
+        click.echo(f'Please try upgrading manually with: pip install --upgrade "{UPGRADE_SOURCE}"', err=True)
         ctx.exit(1)
 
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--upgrade", "mcp-curl"],
+            [sys.executable, "-m", "pip", "install", "--upgrade", UPGRADE_SOURCE],
             capture_output=True,
             text=True,
             check=False,
