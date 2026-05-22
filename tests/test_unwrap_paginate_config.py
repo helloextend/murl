@@ -7,11 +7,20 @@ from pathlib import Path
 import pytest
 
 from murl.cli import (
+    UPGRADE_SOURCE,
     detect_tool_auth_failure,
     find_mcp_config,
     mcp_config_defaults,
     unwrap_text_envelope,
 )
+
+
+def test_upgrade_source_points_at_helloextend_fork():
+    # --upgrade against PyPI silently downgrades fork users to the stale
+    # public mcp-curl release. Pin the install spec to helloextend.
+    assert "helloextend/murl" in UPGRADE_SOURCE
+    assert UPGRADE_SOURCE.startswith("mcp-curl[")
+    assert "git+https://" in UPGRADE_SOURCE
 
 
 # --- unwrap_text_envelope ---

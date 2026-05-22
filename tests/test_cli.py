@@ -546,7 +546,9 @@ def test_upgrade_option():
 
         mock_run.assert_called_once()
         call_args = mock_run.call_args
-        assert call_args[0][0] == [sys.executable, "-m", "pip", "install", "--upgrade", "mcp-curl"]
+        from murl.cli import UPGRADE_SOURCE
+        assert call_args[0][0] == [sys.executable, "-m", "pip", "install", "--upgrade", UPGRADE_SOURCE]
+        assert "helloextend/murl" in UPGRADE_SOURCE
         assert call_args[1]['timeout'] == 300
 
     assert result.exit_code == 0
