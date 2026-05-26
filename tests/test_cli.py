@@ -1153,7 +1153,7 @@ def test_cli_oautherror_surfaces_as_auth_failed():
         result = runner.invoke(main, [f"{TEST_SERVER_URL}/tools", "--login"])
 
     assert result.exit_code != 0
-    payload = json.loads([l for l in result.output.splitlines() if l.strip().startswith("{")][-1])
+    payload = json.loads([ln for ln in result.output.splitlines() if ln.strip().startswith("{")][-1])
     assert payload["error"] == "AUTH_FAILED"
     assert "8080" in payload["message"]
     # The failure-specific suggestion is preserved, not replaced by the --login default.
@@ -1173,6 +1173,6 @@ def test_cli_oautherror_without_suggestion_falls_back_to_login_hint():
         result = runner.invoke(main, [f"{TEST_SERVER_URL}/tools", "--login"])
 
     assert result.exit_code != 0
-    payload = json.loads([l for l in result.output.splitlines() if l.strip().startswith("{")][-1])
+    payload = json.loads([ln for ln in result.output.splitlines() if ln.strip().startswith("{")][-1])
     assert payload["error"] == "AUTH_FAILED"
     assert "--login" in payload["suggestion"]
