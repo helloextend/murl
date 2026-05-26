@@ -1126,3 +1126,53 @@ def test_pagination_single_page_no_extra_calls():
     assert result[0]["name"] == "only_tool"
     # Only one call — no extra pagination requests
     assert mock_session.list_tools.call_count == 1
+
+
+def test_cli_oautherror_surfaces_as_auth_failed():
+    """An OAuthError from the auth flow surfaces as structured AUTH_FAILED.
+
+    Drives the `except OAuthError` handler in cli.py: a port conflict (or any
+    auth failure) must produce {"error":"AUTH_FAILED", ...} with the raise
+    site's failure-specific suggestion — not the generic ERROR fall-through.
+    No live server is needed; authorize() raises before any request is made.
+    """
+    from unittest.mock import patch
+    from murl.auth import OAuthError
+
+    runner = CliRunner()
+    with patch("murl.cli.clear_credentials"), \
+         patch("murl.cli.get_credentials", return_value=None), \
+         patch("murl.cli.save_credentials"), \
+         patch(
+             "murl.cli.authorize",
+             side_effect=OAuthError(
+                 "Callback port 8080 is already in use.",
+                 suggestion="Pass --callback-port <free-port> ...",
+             ),
+         ):
+        result = runner.invoke(main, [f"{TEST_SERVER_URL}/tools", "--login"])
+
+    assert result.exit_code != 0
+    payload = json.loads([l for l in result.output.splitlines() if l.strip().startswith("{")][-1])
+    assert payload["error"] == "AUTH_FAILED"
+    assert "8080" in payload["message"]
+    # The failure-specific suggestion is preserved, not replaced by the --login default.
+    assert payload["suggestion"] == "Pass --callback-port <free-port> ..."
+
+
+def test_cli_oautherror_without_suggestion_falls_back_to_login_hint():
+    """An OAuthError carrying no suggestion falls back to the --login remedy."""
+    from unittest.mock import patch
+    from murl.auth import OAuthError
+
+    runner = CliRunner()
+    with patch("murl.cli.clear_credentials"), \
+         patch("murl.cli.get_credentials", return_value=None), \
+         patch("murl.cli.save_credentials"), \
+         patch("murl.cli.authorize", side_effect=OAuthError("token exchange failed")):
+        result = runner.invoke(main, [f"{TEST_SERVER_URL}/tools", "--login"])
+
+    assert result.exit_code != 0
+    payload = json.loads([l for l in result.output.splitlines() if l.strip().startswith("{")][-1])
+    assert payload["error"] == "AUTH_FAILED"
+    assert "--login" in payload["suggestion"]

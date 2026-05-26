@@ -14,6 +14,7 @@ import html
 import json
 import re
 import secrets
+import socket
 import threading
 import time
 import urllib.parse
@@ -26,9 +27,26 @@ import httpx
 
 CALLBACK_TIMEOUT = 60  # seconds to wait for browser callback
 
+# The de-facto standard port for OAuth callback redirect URIs on localhost.
+# Pre-registered SPA clients (Okta, Cognito) commonly register
+# "http://localhost:8080/callback" and do exact-string matching on redirect_uri,
+# so an ephemeral port would be rejected. Used as the default when neither
+# --callback-port nor .mcp.json callbackPort is supplied.
+STANDARD_OAUTH_CALLBACK_PORT = 8080
+
 
 class OAuthError(Exception):
-    """Raised when an OAuth operation fails."""
+    """Raised when an OAuth operation fails.
+
+    Carries an optional ``suggestion`` — a short, failure-specific remediation
+    hint surfaced to the user. Each raise site can set its own (e.g. a port
+    conflict suggests ``--callback-port``); when omitted, the CLI falls back to
+    a generic ``--login`` hint.
+    """
+
+    def __init__(self, message: str, suggestion: Optional[str] = None) -> None:
+        super().__init__(message)
+        self.suggestion = suggestion
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +391,44 @@ def _run_callback_server(port: int, state: str, timeout: float) -> str:
     return ctx["auth_code"]
 
 
+def _select_callback_port(callback_port: Optional[int]) -> int:
+    """Resolve and validate the OAuth callback port.
+
+    Returns ``callback_port`` when supplied, otherwise the standard 8080. IDPs
+    do exact-string matching on redirect_uri and pre-registered SPA clients
+    almost always register ``http://localhost:8080/callback``, so an ephemeral
+    port would be rejected. Precedence (explicit flag > .mcp.json) is enforced
+    by the caller — any value arriving here as ``callback_port`` already won.
+
+    Probes the chosen port before returning so a conflict fails fast with
+    actionable guidance instead of hanging until the callback times out. The
+    probe socket is closed immediately and the real HTTPServer binds later; the
+    TOCTOU window is acceptable for a local-dev CLI.
+
+    The probe binds with the *same* address family and host the real callback
+    server uses (``HTTPServer((\"localhost\", port))`` — ``HTTPServer`` pins
+    ``address_family`` to AF_INET, so both resolve ``localhost`` to 127.0.0.1).
+    Using ``HTTPServer.address_family`` keeps the probe in lockstep if the
+    server's family is ever changed (e.g. an IPv6 subclass), so the probe can't
+    silently diverge from what actually binds below.
+
+    Raises OAuthError (with a ``--callback-port`` suggestion) if the port is in use.
+    """
+    port = callback_port if callback_port else STANDARD_OAUTH_CALLBACK_PORT
+    try:
+        with socket.socket(HTTPServer.address_family, socket.SOCK_STREAM) as probe:
+            probe.bind(("localhost", port))
+    except OSError as exc:
+        raise OAuthError(
+            f"Callback port {port} is already in use.",
+            suggestion=(
+                "Pass --callback-port <free-port> and register "
+                "http://localhost:<free-port>/callback with your IdP."
+            ),
+        ) from exc
+    return port
+
+
 # ---------------------------------------------------------------------------
 # PKCE helpers
 # ---------------------------------------------------------------------------
@@ -560,13 +616,7 @@ def authorize(server_url: str, www_authenticate: Optional[str] = None,
         )
 
     # --- Step 2: Callback port ---
-    import socket
-    if callback_port:
-        port = callback_port
-    else:
-        with socket.socket() as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
+    port = _select_callback_port(callback_port)
 
     # Use "localhost" rather than "127.0.0.1" — most IDPs (Okta, Cognito, etc.)
     # register redirect URIs with "localhost".  Both resolve to loopback, but
