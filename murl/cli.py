@@ -972,6 +972,18 @@ def main(url: Optional[str], data_flags: Tuple[str, ...], header_flags: Tuple[st
                 message=str(eg),
                 exit_code=ErrorCode.GENERAL_ERROR
             )
+    except OAuthError as e:
+        # The OAuth flow failed (redirect-uri mismatch, port conflict, expired
+        # token with no refresh, discovery failure, etc.). Surface a structured
+        # AUTH_FAILED rather than the generic ERROR fall-through, and prefer the
+        # failure-specific suggestion the raise site attached; otherwise fall
+        # back to the most common remedy — re-authenticating.
+        output_error(
+            error_type="AUTH_FAILED",
+            message=str(e),
+            exit_code=ErrorCode.GENERAL_ERROR,
+            suggestion=e.suggestion or "Re-authenticate with `murl --login <url>`.",
+        )
     except Exception as e:
         error_msg = str(e)
 

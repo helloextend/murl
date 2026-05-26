@@ -1,5 +1,6 @@
 """Tests for the OAuth 2.0 auth module."""
 
+import socket
 import time
 import urllib.parse
 from unittest.mock import patch, MagicMock
@@ -20,6 +21,8 @@ from murl.auth import (
     authorize,
     refresh_token,
     OAuthError,
+    _select_callback_port,
+    STANDARD_OAUTH_CALLBACK_PORT,
 )
 from murl.token_store import (
     get_credentials,
@@ -1110,3 +1113,62 @@ class TestAuthorize:
         ]
         assert warning_calls, "Expected a same-origin-skip warning to be printed"
         assert "oktapreview.com" in warning_calls[0]
+
+
+# ---------------------------------------------------------------------------
+# Callback port selection (issue #10)
+# ---------------------------------------------------------------------------
+
+class TestSelectCallbackPort:
+    """_select_callback_port: default to 8080, honor override, fail fast on conflict."""
+
+    def test_defaults_to_standard_8080_when_unset(self):
+        # No callback_port supplied → the standard SPA redirect-URI port.
+        # Patch the probe so the test doesn't depend on 8080 being free in CI.
+        with patch("murl.auth.socket.socket") as mock_sock:
+            mock_sock.return_value.__enter__.return_value.bind = MagicMock()
+            port = _select_callback_port(None)
+        assert port == STANDARD_OAUTH_CALLBACK_PORT == 8080
+
+    def test_explicit_port_takes_precedence_over_default(self):
+        with patch("murl.auth.socket.socket") as mock_sock:
+            mock_sock.return_value.__enter__.return_value.bind = MagicMock()
+            port = _select_callback_port(9123)
+        assert port == 9123
+
+    def test_probes_the_selected_port(self):
+        # The probe must bind the chosen port (not an ephemeral 0).
+        with patch("murl.auth.socket.socket") as mock_sock:
+            bind = mock_sock.return_value.__enter__.return_value.bind
+            _select_callback_port(8080)
+        bind.assert_called_once_with(("localhost", 8080))
+
+    def test_port_in_use_raises_actionable_oautherror(self):
+        # Occupy a real ephemeral port, then ask the selector to use it.
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as occupied:
+            occupied.bind(("localhost", 0))
+            occupied.listen(1)
+            taken = occupied.getsockname()[1]
+
+            with pytest.raises(OAuthError) as exc_info:
+                _select_callback_port(taken)
+
+        err = exc_info.value
+        assert str(taken) in str(err)
+        assert "already in use" in str(err)
+        # Suggestion is failure-specific: point at --callback-port, not --login.
+        assert err.suggestion is not None
+        assert "--callback-port" in err.suggestion
+
+
+class TestOAuthErrorSuggestion:
+    """OAuthError carries an optional failure-specific suggestion."""
+
+    def test_default_suggestion_is_none(self):
+        err = OAuthError("boom")
+        assert str(err) == "boom"
+        assert err.suggestion is None
+
+    def test_suggestion_is_preserved(self):
+        err = OAuthError("boom", suggestion="do the thing")
+        assert err.suggestion == "do the thing"
