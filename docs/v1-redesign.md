@@ -2,7 +2,7 @@
 
 **Status:** Proposal — not implemented. Filed to capture the design before details fade.
 **Audience:** murl contributors and downstream consumers.
-**Author:** Mike Darmousseh (turlockmike), with critique from Rob Pike via in-house review.
+**Author:** Mike Darmousseh (turlockmike).
 
 ## Problem statement
 
